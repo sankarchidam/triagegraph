@@ -1,0 +1,36 @@
+{
+  "scenario_name": "kafka_consumer_lag_deploy",
+  "description": "A deploy 20 minutes before the alert introduced a slower Avro deserialization path with a 3s schema-registry timeout. Consumer lag climbs steadily; error rate and CPU stay normal. Correct root cause: the deploy.",
+  "correct_root_cause": "deploy",
+  "correct_root_cause_summary": "PR #482 (Avro deserialization + schema-registry client) merged 20 minutes before the alert; the added per-message schema-registry round trip is the direct cause of the consumer lag climb.",
+  "service_name": "orders-consumer",
+  "requires_widened_window": false,
+
+  "alert": {
+    "alert_name": "KafkaConsumerLagHigh",
+    "service": "orders-consumer",
+    "severity": "warning",
+    "message": "Consumer lag for orders-consumer exceeded 50000 messages"
+  },
+
+  "metrics": {
+    "kafka_consumer_lag": {"baseline": 500, "unit": "messages", "pattern": "linear_climb", "anomaly_start_offset_minutes": -18, "anomaly_end_offset_minutes": 0, "peak_value": 62000},
+    "cpu_usage_pct": {"baseline": 35, "unit": "pct", "pattern": "flat"},
+    "error_rate_pct": {"baseline": 0.2, "unit": "pct", "pattern": "flat"},
+    "memory_usage_mb": {"baseline": 1200, "unit": "mb", "pattern": "flat"}
+  },
+
+  "logs": [
+    {"offset_minutes": -17, "level": "WARN", "message": "schema-registry request timed out after 3000ms, retrying (attempt 1)"},
+    {"offset_minutes": -14, "level": "WARN", "message": "schema-registry request timed out after 3000ms, retrying (attempt 1)"},
+    {"offset_minutes": -9, "level": "WARN", "message": "schema-registry request timed out after 3000ms, retrying (attempt 2)"},
+    {"offset_minutes": -5, "level": "INFO", "message": "consumer group rebalance triggered for orders-consumer"},
+    {"offset_minutes": -2, "level": "WARN", "message": "schema-registry request timed out after 3000ms, retrying (attempt 1)"}
+  ],
+
+  "deploys": [
+    {"offset_minutes": -20, "pr_number": 482, "title": "Switch order-events deserialization to Avro schema v3", "author": "j.rivera", "diff_summary": "Replaces JSON deserializer with Avro deserializer for order-events topic; adds schema-registry client with a 3s request timeout per message."}
+  ],
+
+  "postmortem_match": null
+}

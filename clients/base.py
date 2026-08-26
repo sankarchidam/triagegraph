@@ -1,0 +1,40 @@
+"""
+Abstract interfaces. Each dummy client implements the same method signature
+shape as its real counterpart, so migrating off dummy data later (§12 of
+the design doc) is a constructor swap in config.py, not a rewrite of
+graph/nodes.py.
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+
+class MetricsClient(ABC):
+    @abstractmethod
+    def query_range(self, query: str, start: str, end: str, step: str = "60s") -> dict:
+        """Must return the same shape as prometheus_api_client's query_range output:
+        {"status": "success", "data": {"resultType": "matrix", "result": [...]}}"""
+        ...
+
+
+class LogsClient(ABC):
+    @abstractmethod
+    def search(self, service_name: str, start: str, end: str, query: str = "") -> list[dict]:
+        """Must return a list of log/trace entries shaped like
+        {"timestamp": ..., "level": ..., "message": ..., "trace_id": ...}"""
+        ...
+
+
+class DeployClient(ABC):
+    @abstractmethod
+    def list_deploys(self, service_name: str, start: str, end: str) -> list[dict]:
+        """Must return a list of merged-PR/deploy events shaped like
+        {"pr_number": ..., "title": ..., "merged_at": ..., "author": ..., "diff_summary": ...}"""
+        ...
+
+
+class PostmortemStore(ABC):
+    @abstractmethod
+    def search(self, query_text: str, k: int = 3) -> list[dict]:
+        """Must return a list of {"doc_id": ..., "text": ..., "score": ...}"""
+        ...

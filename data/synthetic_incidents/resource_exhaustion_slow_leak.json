@@ -1,0 +1,31 @@
+{
+  "scenario_name": "resource_exhaustion_slow_leak",
+  "description": "No recent deploy, no downstream issue. Memory has been climbing linearly for 6 hours -- invisible in the default 30-minute window, where it just looks like a high-but-flat plateau. Visible only once the window is widened. OOM kill in the logs at alert time. Correct root cause: a slow memory leak. This scenario specifically tests whether the agent widens the window instead of tunnel-visioning on the default 30 minutes.",
+  "correct_root_cause": "resource_exhaustion",
+  "correct_root_cause_summary": "A slow memory leak climbed for roughly 6 hours before the alert; the OOM kill at alert time is the symptom, not the start of the story. No deploy and no downstream dependency issue caused this.",
+  "service_name": "recommendations-worker",
+  "requires_widened_window": true,
+
+  "alert": {
+    "alert_name": "RecommendationsWorkerOOMKilled",
+    "service": "recommendations-worker",
+    "severity": "critical",
+    "message": "recommendations-worker was OOM killed"
+  },
+
+  "metrics": {
+    "memory_usage_mb": {"baseline": 1000, "unit": "mb", "pattern": "linear_climb", "anomaly_start_offset_minutes": -360, "anomaly_end_offset_minutes": 0, "peak_value": 2800},
+    "cpu_usage_pct": {"baseline": 38, "unit": "pct", "pattern": "flat"},
+    "error_rate_pct": {"baseline": 0.3, "unit": "pct", "pattern": "flat"},
+    "latency_p99_ms": {"baseline": 140, "unit": "ms", "pattern": "flat"}
+  },
+
+  "logs": [
+    {"offset_minutes": -3, "level": "WARN", "message": "GC pause exceeded 2000ms"},
+    {"offset_minutes": -1, "level": "CRITICAL", "message": "OOM killer invoked: killed process recommendations-worker (pid 4821)"}
+  ],
+
+  "deploys": [],
+
+  "postmortem_match": null
+}

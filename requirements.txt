@@ -1,0 +1,18 @@
+# Milestone 1
+langgraph
+pydantic
+pydantic-settings
+
+# Milestone 2 -- postmortem retrieval is "real from day one" per the design
+# doc (§3/§6.1: it's local anyway), so these came in now, not milestone 6.
+chromadb
+sentence-transformers
+
+# Milestone 3 (reasoning nodes, LLM calls). Only the provider set via
+# LLM_PROVIDER in .env needs to actually be installed -- graph/llm.py
+# imports the SDK lazily, so having both here is harmless if you only use one.
+langchain-openai
+langchain-anthropic
+
+# Milestone 5 (eval harness)
+langsmith

@@ -1,0 +1,34 @@
+{
+  "scenario_name": "downstream_dependency_outage",
+  "description": "No recent deploy. Latency and error rate climb together, correlated with repeated payment-gateway health check failures in the logs. A postmortem from 3 months ago describes the same downstream dependency failing the same way. Correct root cause: the downstream dependency, not checkout-service itself.",
+  "correct_root_cause": "downstream_dependency",
+  "correct_root_cause_summary": "payment-gateway (a downstream dependency) became unavailable; checkout-service's aggressive retry policy amplified the impact. No deploy to checkout-service caused this.",
+  "service_name": "checkout-service",
+  "requires_widened_window": false,
+
+  "alert": {
+    "alert_name": "CheckoutServiceErrorRateHigh",
+    "service": "checkout-service",
+    "severity": "critical",
+    "message": "checkout-service error rate exceeded 5% for 5 minutes"
+  },
+
+  "metrics": {
+    "error_rate_pct": {"baseline": 0.5, "unit": "pct", "pattern": "linear_climb", "anomaly_start_offset_minutes": -25, "anomaly_end_offset_minutes": -2, "peak_value": 8.0},
+    "latency_p99_ms": {"baseline": 120, "unit": "ms", "pattern": "linear_climb", "anomaly_start_offset_minutes": -25, "anomaly_end_offset_minutes": -2, "peak_value": 2200},
+    "cpu_usage_pct": {"baseline": 40, "unit": "pct", "pattern": "flat"},
+    "memory_usage_mb": {"baseline": 800, "unit": "mb", "pattern": "flat"}
+  },
+
+  "logs": [
+    {"offset_minutes": -24, "level": "ERROR", "message": "payment-gateway health check failed: connection timeout"},
+    {"offset_minutes": -18, "level": "ERROR", "message": "payment-gateway health check failed: connection timeout"},
+    {"offset_minutes": -12, "level": "ERROR", "message": "payment-gateway health check failed: connection timeout"},
+    {"offset_minutes": -6, "level": "ERROR", "message": "payment-gateway health check failed: connection timeout"},
+    {"offset_minutes": -1, "level": "ERROR", "message": "payment-gateway health check failed: connection timeout"}
+  ],
+
+  "deploys": [],
+
+  "postmortem_match": "downstream_payment_gateway_outage"
+}
