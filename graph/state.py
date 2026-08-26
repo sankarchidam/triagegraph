@@ -51,5 +51,8 @@ class IncidentState(TypedDict):
     evidence_sufficient: bool  # set by assess_evidence; drives the widen_time_window conditional edge
 
     human_approved: bool
-    human_decision: str  # "accept" | "pick_other" | "reject" -- set at the approval gate
+    human_decision: str  # "accept" | "pick_other:<id>" | "reject" -- set at the approval gate
+    human_feedback: Optional[str]  # freeform text on reject, fed back into the re-investigation pass
+    reinvestigated: bool  # set by generate_hypotheses when it runs a feedback-driven re-investigation;
+    # guards the reject loop to at most once, same pattern as time_window_widened
     final_report_markdown: str

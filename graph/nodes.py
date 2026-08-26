@@ -21,6 +21,14 @@ Milestone 3 adds: generate_hypotheses and rank_hypotheses -- the project's
 first real LLM calls, via graph.llm.get_chat_model() so the provider
 (OpenAI or Anthropic, config.py's llm_provider) is a config change, not a
 code change here.
+
+Milestone 4 adds: human_approval_gate, a no-op node that exists purely as
+an interrupt_before target (graph/build_graph.py pauses execution before
+it runs; main.py does the actual human interaction via graph.get_state /
+update_state / resume). Reject routes back to generate_hypotheses with
+human_feedback folded into the prompt -- capped at one re-investigation
+pass via the `reinvestigated` flag, the same one-shot-loop pattern as
+widen_time_window/time_window_widened.
 """
 from __future__ import annotations
 
@@ -285,11 +293,19 @@ confidence."""
 
 def generate_hypotheses(state: IncidentState) -> dict:
     evidence = _all_evidence(state)
-    model = get_chat_model(settings.reasoning_model).with_structured_output(GeneratedHypotheses)
+    feedback = state.get("human_feedback")
 
+    user_content = f"Alert: {state['alert_summary']}\nService: {state['service_name']}\n\nEvidence:\n{_evidence_listing(evidence)}"
+    if feedback:
+        user_content += (
+            f"\n\nA human reviewer rejected the previous hypothesis set and asked you to re-investigate with this "
+            f"specific feedback -- treat it as the most important signal in this pass: {feedback}"
+        )
+
+    model = get_chat_model(settings.reasoning_model).with_structured_output(GeneratedHypotheses)
     result: GeneratedHypotheses = model.invoke([
         {"role": "system", "content": GENERATE_HYPOTHESES_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Alert: {state['alert_summary']}\nService: {state['service_name']}\n\nEvidence:\n{_evidence_listing(evidence)}"},
+        {"role": "user", "content": user_content},
     ])
 
     hypotheses = [
@@ -303,7 +319,13 @@ def generate_hypotheses(state: IncidentState) -> dict:
         )
         for i, d in enumerate(result.hypotheses)
     ]
-    return {"hypotheses": hypotheses, "insufficient_evidence_note": result.insufficient_evidence_note}
+    out = {"hypotheses": hypotheses, "insufficient_evidence_note": result.insufficient_evidence_note}
+    if feedback:
+        # Only a feedback-driven pass counts as "the one re-investigation" -- the
+        # initial run must never set this, or route_after_human_decision would
+        # never allow the loop to fire at all.
+        out["reinvestigated"] = True
+    return out
 
 
 class RankedHypothesis(BaseModel):
@@ -377,6 +399,30 @@ def rank_hypotheses(state: IncidentState) -> dict:
     return {"ranked_hypotheses": ranked}
 
 
+# ---------------------------------------------------------------------------
+# Milestone 4: human approval gate
+# ---------------------------------------------------------------------------
+
+def human_approval_gate(state: IncidentState) -> dict:
+    """Deliberately a no-op. The real work happens outside the graph: this
+    node's only job is to exist as an interrupt_before target, so
+    build_graph()'s compiled graph pauses *before* running it. main.py reads
+    the paused state, prompts the human, writes the decision back via
+    graph.update_state(), and resumes -- by the time this function body
+    actually executes, human_decision is already set."""
+    return {}
+
+
+def route_after_human_decision(state: IncidentState) -> str:
+    """Conditional edge target selector for human_approval_gate. Reject loops
+    back to generate_hypotheses exactly once -- reinvestigated guards against
+    a second reject ever looping again, so a reviewer who rejects twice in a
+    row still gets a terminal report instead of an infinite gate."""
+    if state.get("human_decision") == "reject" and not state.get("reinvestigated"):
+        return "reinvestigate"
+    return "finalize"
+
+
 def finalize_report(state: IncidentState) -> dict:
     lines = [
         f"# Incident Report: {state['service_name']}",
@@ -416,6 +462,24 @@ def finalize_report(state: IncidentState) -> dict:
             lines.append(f"- Contradicting: {', '.join(h.contradicting_evidence) or '(none cited)'}")
             lines.append(f"- Next step: {h.recommended_next_step}")
             lines.append("")
+
+    decision = state.get("human_decision", "")
+    top_id = ranked[0].id if ranked else None
+    lines.append("## Human decision")
+    if decision == "accept":
+        lines.append(f"✅ **Accepted** -- {top_id} approved as the leading hypothesis, as ranked.")
+    elif decision.startswith("pick_other:"):
+        chosen_id = decision.split(":", 1)[1]
+        lines.append(f"✅ **Approved** -- reviewer selected {chosen_id} over the model's top-ranked {top_id}.")
+    elif decision == "reject":
+        lines.append(
+            f"❌ **Rejected after one re-investigation pass** -- reviewer feedback: "
+            f"\"{state.get('human_feedback', '(none given)')}\". No hypothesis above is approved; "
+            f"escalate to a human on-call for manual investigation."
+        )
+    else:
+        lines.append(f"(no decision recorded: {decision!r})")
+    lines.append("")
 
     return {"final_report_markdown": "\n".join(lines)}
 

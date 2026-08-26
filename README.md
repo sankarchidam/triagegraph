@@ -12,7 +12,7 @@ This is **v1** — the design doc (linked internally) was reviewed and
 adjusted before building; see "Design decisions" below for what changed and
 why.
 
-## Status: Milestone 3 (reasoning nodes) — done, all 3 golden scenarios correct at top-1
+## Status: Milestone 4 (human approval gate) — done
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -21,7 +21,33 @@ cp .env.example .env   # fill in OPENAI_API_KEY (or ANTHROPIC_API_KEY + LLM_PROV
 python main.py --scenario kafka_consumer_lag_deploy
 python main.py --scenario downstream_dependency_outage
 python main.py --scenario resource_exhaustion_slow_leak
+
+# non-interactive (accepts top hypothesis every time -- for scripted/regression runs)
+python main.py --scenario kafka_consumer_lag_deploy --auto-approve
 ```
+
+**Milestone 4: `human_approval_gate`.** The graph now pauses before showing
+ranked hypotheses to a human, via LangGraph's `interrupt_before` + a
+`MemorySaver` checkpointer (`graph/build_graph.py`). `human_approval_gate`
+itself is a deliberate no-op — its only job is to be the pause point;
+`main.py` reads the paused state with `graph.get_state()`, prompts
+interactively, writes the decision back with `graph.update_state()`, and
+resumes with `graph.invoke(None, config)`. Three outcomes:
+
+- **Accept** — top-ranked hypothesis approved as-is.
+- **Pick a different hypothesis** — reviewer overrides the model's ranking;
+  the report records both the model's top pick and the human's actual
+  choice, without silently reordering `ranked_hypotheses` (an honesty
+  choice: the report should show what the model ranked *and* what the
+  human decided, not blur the two).
+- **Reject, with feedback** — routes back to `generate_hypotheses` for one
+  feedback-driven re-investigation pass (the human's text is folded
+  directly into the prompt), then returns to the gate. A second reject in
+  a row terminates instead of looping again — `reinvestigated` guards it,
+  same one-shot-loop pattern as `time_window_widened`. Verified: gate fires
+  exactly twice on a single reject, exactly twice (not three times) on a
+  double reject, with the second producing a clean "escalate to a human
+  on-call" report instead of hanging.
 
 Milestones 1-2 still need **zero API key** (every node through
 `assess_evidence`/`widen_time_window` is rule-based). Milestone 3 adds the
@@ -141,7 +167,8 @@ graph/
   state.py                         IncidentState, Evidence, Hypothesis
   nodes.py                          node functions, including generate_hypotheses/rank_hypotheses prompts
   llm.py                             provider-agnostic chat model factory (OpenAI/Anthropic)
-  build_graph.py                    StateGraph wiring: fan-out/fan-in + the widen_time_window conditional loop
+  build_graph.py                    StateGraph wiring: fan-out/fan-in, widen_time_window loop, human_approval_gate
+                                     (interrupt_before + MemorySaver checkpointer)
 main.py                            CLI entrypoint
 config.py                          Settings (dummy_mode, llm_provider, API keys, active_scenario)
 .chroma/                            Chroma's on-disk index (gitignored, rebuilt automatically if missing/stale)
@@ -167,9 +194,8 @@ separated from unrelated distractors at 0.41 and 0.32.
 
 ## Roadmap
 
-- **Milestone 4** — human_approval_gate via `interrupt_before`; the CLI
-  prompt to accept / pick a different hypothesis / reject and re-investigate.
 - **Milestone 5** — LangSmith tracing + a script that runs all golden
-  scenarios and reports the accuracy table from design doc §9.
+  scenarios and reports the accuracy table from design doc §9 (`--auto-approve`
+  makes this a non-interactive batch run now that Milestone 4 is done).
 - **Milestone 6** — postmortem reranking polish; investigate the scenario 3
   zero-evidence hallucination noted above.
