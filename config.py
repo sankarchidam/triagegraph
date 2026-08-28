@@ -9,6 +9,7 @@ provider: nodes call graph.llm.get_chat_model(model_name), never a
 provider's SDK directly. llm_provider picks OpenAI vs Anthropic; only
 config.py and graph/llm.py know which one is actually in play.
 """
+import os
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,6 +25,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     langsmith_api_key: str = ""
+    langsmith_project: str = "triagegraph"
 
     # Model split: generate_hypotheses does real reasoning over ambiguous
     # evidence: give it the strongest model. rank_hypotheses is closer to
@@ -36,3 +38,15 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# LangSmith tracing (milestone 5) is entirely optional, same as everything
+# else gated behind an empty-string default: leave LANGSMITH_API_KEY unset
+# in .env and this is a no-op, same as milestones 1-2 needing no API key at
+# all. langsmith's own tracing_is_enabled() checks LANGSMITH_TRACING (or
+# the legacy LANGCHAIN_TRACING_V2) directly from os.environ -- there's no
+# constructor arg to pass this through via graph/llm.py, so this is the one
+# place config.py reaches into os.environ instead of just being read from.
+if settings.langsmith_api_key:
+    os.environ.setdefault("LANGSMITH_TRACING", "true")
+    os.environ.setdefault("LANGSMITH_API_KEY", settings.langsmith_api_key)
+    os.environ.setdefault("LANGSMITH_PROJECT", settings.langsmith_project)

@@ -5,6 +5,7 @@
   "correct_root_cause_summary": "payment-gateway (a downstream dependency) became unavailable; checkout-service's aggressive retry policy amplified the impact. No deploy to checkout-service caused this.",
   "service_name": "checkout-service",
   "requires_widened_window": false,
+  "eval_keywords": ["payment-gateway", "payment gateway", "downstream"],
 
   "alert": {
     "alert_name": "CheckoutServiceErrorRateHigh",

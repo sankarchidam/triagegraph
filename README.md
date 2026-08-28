@@ -12,7 +12,7 @@ This is **v1** — the design doc (linked internally) was reviewed and
 adjusted before building; see "Design decisions" below for what changed and
 why.
 
-## Status: Milestone 4 (human approval gate) — done
+## Status: Milestone 5 (tracing + eval harness) — done
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -24,6 +24,9 @@ python main.py --scenario resource_exhaustion_slow_leak
 
 # non-interactive (accepts top hypothesis every time -- for scripted/regression runs)
 python main.py --scenario kafka_consumer_lag_deploy --auto-approve
+
+# eval harness -- runs every golden scenario and prints the accuracy table
+python -m scripts.eval_scenarios
 ```
 
 **Milestone 4: `human_approval_gate`.** The graph now pauses before showing
@@ -48,6 +51,45 @@ resumes with `graph.invoke(None, config)`. Three outcomes:
   exactly twice on a single reject, exactly twice (not three times) on a
   double reject, with the second producing a clean "escalate to a human
   on-call" report instead of hanging.
+
+**Milestone 5: tracing + eval harness.**
+
+- **LangSmith tracing** is a config toggle, same philosophy as everything
+  else in this project: `config.py` sets `LANGSMITH_TRACING`/
+  `LANGSMITH_API_KEY`/`LANGSMITH_PROJECT` in `os.environ` iff
+  `LANGSMITH_API_KEY` is non-empty in `.env` -- LangChain's chat models
+  pick up tracing automatically from there, no code change in `graph/llm.py`
+  or the nodes. Leave the key blank and it's a no-op, same as every other
+  optional integration here. (Not yet verified against a real LangSmith
+  project -- no key configured locally when this was built. The wiring is
+  in; point it at a real account to confirm traces land.)
+- **`scripts/eval_scenarios.py`** runs every golden scenario with
+  `--auto-approve` (via the same `graph/runner.run_incident()` main.py
+  uses -- pulled into a shared module specifically because milestone 5
+  needed a second, non-interactive caller) and prints an accuracy table:
+  top-1 hypothesis id/confidence, whether it's correct, whether the time
+  window widened exactly when the scenario expects it to (not just "at
+  least"), and postmortem-retrieval accuracy where a scenario has one.
+  Grading is deliberately **not** LLM-as-judge -- each scenario JSON now
+  carries an `eval_keywords` fixture (attached by me, the scenario author,
+  before ever seeing what the model would say), and a top-1 hypothesis
+  counts as correct if its description contains any of them. Simple,
+  deterministic, and auditable straight from the printed table -- grading
+  the model with another instance of the same kind of model felt like the
+  wrong tradeoff for a 3-scenario regression check.
+- **Current result: 3/3 top-1 accuracy**, unchanged from the manual
+  verification in milestone 3 -- this just makes it a repeatable one-line
+  command instead of three manual reads of a markdown report.
+
+```
+scenario                        root cause             top1  conf   correct  window  postmortem
+--------------------------------------------------------------------------------------------------
+downstream_dependency_outage    downstream_dependency  h1    0.90   YES      ok      OK (downstream_payment_gateway_outage)
+kafka_consumer_lag_deploy       deploy                 h1    0.90   YES      ok      n/a
+resource_exhaustion_slow_leak   resource_exhaustion    h1    0.80   YES      ok      n/a
+--------------------------------------------------------------------------------------------------
+Top-1 accuracy: 3/3
+```
 
 Milestones 1-2 still need **zero API key** (every node through
 `assess_evidence`/`widen_time_window` is rule-based). Milestone 3 adds the
@@ -169,6 +211,9 @@ graph/
   llm.py                             provider-agnostic chat model factory (OpenAI/Anthropic)
   build_graph.py                    StateGraph wiring: fan-out/fan-in, widen_time_window loop, human_approval_gate
                                      (interrupt_before + MemorySaver checkpointer)
+  runner.py                         shared invoke/get_state/update_state/resume loop (main.py + eval_scenarios.py)
+scripts/
+  eval_scenarios.py                 milestone 5 eval harness -- runs all golden scenarios, prints accuracy table
 main.py                            CLI entrypoint
 config.py                          Settings (dummy_mode, llm_provider, API keys, active_scenario)
 .chroma/                            Chroma's on-disk index (gitignored, rebuilt automatically if missing/stale)
@@ -194,8 +239,10 @@ separated from unrelated distractors at 0.41 and 0.32.
 
 ## Roadmap
 
-- **Milestone 5** — LangSmith tracing + a script that runs all golden
-  scenarios and reports the accuracy table from design doc §9 (`--auto-approve`
-  makes this a non-interactive batch run now that Milestone 4 is done).
 - **Milestone 6** — postmortem reranking polish; investigate the scenario 3
-  zero-evidence hallucination noted above.
+  hallucinated Kafka hypothesis noted above (it's evolved: earlier it cited
+  zero evidence, the latest run instead misused an unrelated postmortem as
+  "supporting" evidence -- still harmless since it's ranked last, but worth
+  understanding before calling milestone 3's reasoning nodes fully settled).
+- Verify LangSmith tracing against a real project (needs an actual
+  `LANGSMITH_API_KEY` -- the wiring's in, just unverified end-to-end).

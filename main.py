@@ -8,23 +8,23 @@ Usage:
     python main.py --scenario kafka_consumer_lag_deploy --auto-approve   # non-interactive, accepts top hypothesis
 
 Milestone 4: the compiled graph now pauses before human_approval_gate
-(interrupt_before, see graph/build_graph.py). Each run gets its own
-thread_id so the MemorySaver checkpointer can track it; invoke() returns
-the paused state, prompt_human() reads it and writes a decision back via
-update_state(), and invoke(None, ...) resumes from exactly where it
-stopped. --auto-approve skips the prompt (accepts the top hypothesis
-every time) -- needed for scripted/regression runs, and anticipates
-milestone 5's eval harness running all golden scenarios unattended.
+(interrupt_before, see graph/build_graph.py). graph/runner.py's
+run_incident() drives the invoke/get_state/update_state/resume loop;
+prompt_human() below is the interactive decide() callback it calls each
+time the graph pauses. --auto-approve swaps in auto_approve() instead
+(accepts the top hypothesis every time, no prompt) -- needed for
+scripted/regression runs; milestone 5's scripts/eval_scenarios.py reuses
+the same run_incident() with its own auto-approve callback.
 """
 from __future__ import annotations
 
 import argparse
 import datetime
-import uuid
 from pathlib import Path
 
 from clients.scenario_loader import load_scenario
 from graph.build_graph import build_graph
+from graph.runner import run_incident
 from config import settings
 
 
@@ -81,19 +81,10 @@ def main():
 
     alert_raw = build_alert_payload(args.scenario)
     graph = build_graph()
-    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
     decide = auto_approve if args.auto_approve else prompt_human
 
     print(f"Running scenario: {args.scenario!r}\n")
-    state = graph.invoke({"alert_raw": alert_raw}, config=config)
-
-    # interrupt_before pauses execution and returns the state as of the pause;
-    # graph.get_state(config).next lists the node(s) still queued to run. An
-    # empty tuple means the graph ran to END with nothing paused.
-    while graph.get_state(config).next:
-        decision_update = decide(state)
-        graph.update_state(config, decision_update)
-        state = graph.invoke(None, config=config)
+    state = run_incident(alert_raw, decide, graph)
 
     print(state["final_report_markdown"])
 
