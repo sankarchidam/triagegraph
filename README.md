@@ -60,9 +60,12 @@ resumes with `graph.invoke(None, config)`. Three outcomes:
   `LANGSMITH_API_KEY` is non-empty in `.env` -- LangChain's chat models
   pick up tracing automatically from there, no code change in `graph/llm.py`
   or the nodes. Leave the key blank and it's a no-op, same as every other
-  optional integration here. (Not yet verified against a real LangSmith
-  project -- no key configured locally when this was built. The wiring is
-  in; point it at a real account to confirm traces land.)
+  optional integration here. **Verified against a real LangSmith project**:
+  a `kafka_consumer_lag_deploy` run's full node tree (`normalize_alert` ->
+  fan-out -> ... -> `human_approval_gate` -> `finalize_report`) showed up
+  in the `triagegraph` project, confirmed by querying the LangSmith API
+  directly (`client.list_runs(project_name="triagegraph")`), not just "no
+  error was thrown."
 - **`scripts/eval_scenarios.py`** runs every golden scenario with
   `--auto-approve` (via the same `graph/runner.run_incident()` main.py
   uses -- pulled into a shared module specifically because milestone 5
@@ -244,5 +247,3 @@ separated from unrelated distractors at 0.41 and 0.32.
   zero evidence, the latest run instead misused an unrelated postmortem as
   "supporting" evidence -- still harmless since it's ranked last, but worth
   understanding before calling milestone 3's reasoning nodes fully settled).
-- Verify LangSmith tracing against a real project (needs an actual
-  `LANGSMITH_API_KEY` -- the wiring's in, just unverified end-to-end).
