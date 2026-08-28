@@ -1,13 +1,18 @@
 """
-Central config. Every client constructor checks settings.dummy_mode and
-returns the dummy or real implementation -- nodes never know which one
-they're talking to. See clients/base.py for the abstract interfaces that
-make that swap possible later (§12 of the design doc: v1).
+Central config.
 
-Same swap-without-touching-node-logic philosophy applies to the LLM
-provider: nodes call graph.llm.get_chat_model(model_name), never a
-provider's SDK directly. llm_provider picks OpenAI vs Anthropic; only
-config.py and graph/llm.py know which one is actually in play.
+dummy_mode is aspirational, not yet wired up: clients/base.py defines
+abstract interfaces (MetricsClient, LogsClient, DeployClient,
+PostmortemStore) specifically so a real Prometheus/Splunk/GitHub client
+could be swapped in as a constructor change later, but graph/nodes.py
+currently imports the Dummy* implementations directly and no real
+implementation exists yet -- flipping this flag today does nothing. See
+the README's "Known limitations" section.
+
+The LLM provider swap is real, not aspirational: nodes call
+graph.llm.get_chat_model(model_name), never a provider's SDK directly.
+llm_provider picks OpenAI vs Anthropic; only config.py and graph/llm.py
+know which one is actually in play.
 """
 import os
 from typing import Literal

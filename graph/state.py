@@ -21,7 +21,6 @@ class Evidence(BaseModel):
     raw_ref: str  # pointer to raw data: the query used, a log id, a PR number, etc.
     is_notable: bool = True  # False for "checked, nothing unusual" evidence (e.g. a flat metric) --
     # machine-checkable so assess_evidence doesn't have to parse English out of `summary`
-    supports_hypothesis: Optional[str] = None  # filled in during ranking
 
 
 class Hypothesis(BaseModel):

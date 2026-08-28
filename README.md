@@ -1,88 +1,169 @@
 # TriageGraph
 
-An agentic incident-triage copilot built on LangGraph: give it an alert, it
-reasons over metrics, logs, recent deploys, and past postmortems, and
-produces a ranked root-cause hypothesis tree — with a human approval gate
-before anything is treated as "actioned." Runs entirely on localhost against
-scenario-driven dummy data, with abstract client interfaces designed so
-swapping in real Prometheus/Splunk/Dynatrace/GitHub credentials later is a
-constructor change, not a rewrite.
+An agentic incident-triage copilot built on [LangGraph](https://langchain-ai.github.io/langgraph/). Give it an alert and it fans out across metrics, logs, recent deploys, and past postmortems, reasons over all four with an LLM, and produces a ranked, evidence-cited root-cause hypothesis tree — pausing for a human's sign-off before anything is treated as "actioned." It currently runs entirely on localhost against scenario-driven synthetic data (no real Prometheus/Splunk/GitHub account needed), with the data layer built behind abstract interfaces specifically so real credentials can be dropped in later.
 
-This is **v1** — the design doc (linked internally) was reviewed and
-adjusted before building; see "Design decisions" below for what changed and
-why.
+This document is meant to be sufficient on its own: architecture, why it's built the way it is, how to run and test it, and what to watch out for. It does not track development history — read the git log for that.
 
-## Status: Milestone 6 (postmortem filtering + hallucination fixes) — done
+---
+
+## Quickstart
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in OPENAI_API_KEY (or ANTHROPIC_API_KEY + LLM_PROVIDER=anthropic)
-python main.py --scenario kafka_consumer_lag_deploy
-python main.py --scenario downstream_dependency_outage
-python main.py --scenario resource_exhaustion_slow_leak
+cp .env.example .env          # fill in OPENAI_API_KEY (or ANTHROPIC_API_KEY + LLM_PROVIDER=anthropic)
 
-# non-interactive (accepts top hypothesis every time -- for scripted/regression runs)
-python main.py --scenario kafka_consumer_lag_deploy --auto-approve
-
-# eval harness -- runs every golden scenario and prints the accuracy table
-python -m scripts.eval_scenarios
+python main.py --scenario kafka_consumer_lag_deploy          # interactive: prompts you at the approval gate
+python main.py --scenario kafka_consumer_lag_deploy --auto-approve --out report.md
+python -m scripts.eval_scenarios                              # runs all 3 golden scenarios, prints an accuracy table
 ```
 
-**Milestone 4: `human_approval_gate`.** The graph now pauses before showing
-ranked hypotheses to a human, via LangGraph's `interrupt_before` + a
-`MemorySaver` checkpointer (`graph/build_graph.py`). `human_approval_gate`
-itself is a deliberate no-op — its only job is to be the pause point;
-`main.py` reads the paused state with `graph.get_state()`, prompts
-interactively, writes the decision back with `graph.update_state()`, and
-resumes with `graph.invoke(None, config)`. Three outcomes:
+No API key is needed to explore evidence-gathering alone — every node up through `assess_evidence`/`widen_time_window` is rule-based. A key is only required once execution reaches `generate_hypotheses` (see [Architecture](#architecture)).
 
-- **Accept** — top-ranked hypothesis approved as-is.
-- **Pick a different hypothesis** — reviewer overrides the model's ranking;
-  the report records both the model's top pick and the human's actual
-  choice, without silently reordering `ranked_hypotheses` (an honesty
-  choice: the report should show what the model ranked *and* what the
-  human decided, not blur the two).
-- **Reject, with feedback** — routes back to `generate_hypotheses` for one
-  feedback-driven re-investigation pass (the human's text is folded
-  directly into the prompt), then returns to the gate. A second reject in
-  a row terminates instead of looping again — `reinvestigated` guards it,
-  same one-shot-loop pattern as `time_window_widened`. Verified: gate fires
-  exactly twice on a single reject, exactly twice (not three times) on a
-  double reject, with the second producing a clean "escalate to a human
-  on-call" report instead of hanging.
+---
 
-**Milestone 5: tracing + eval harness.**
+## Architecture
 
-- **LangSmith tracing** is a config toggle, same philosophy as everything
-  else in this project: `config.py` sets `LANGSMITH_TRACING`/
-  `LANGSMITH_API_KEY`/`LANGSMITH_PROJECT` in `os.environ` iff
-  `LANGSMITH_API_KEY` is non-empty in `.env` -- LangChain's chat models
-  pick up tracing automatically from there, no code change in `graph/llm.py`
-  or the nodes. Leave the key blank and it's a no-op, same as every other
-  optional integration here. **Verified against a real LangSmith project**:
-  a `kafka_consumer_lag_deploy` run's full node tree (`normalize_alert` ->
-  fan-out -> ... -> `human_approval_gate` -> `finalize_report`) showed up
-  in the `triagegraph` project, confirmed by querying the LangSmith API
-  directly (`client.list_runs(project_name="triagegraph")`), not just "no
-  error was thrown."
-- **`scripts/eval_scenarios.py`** runs every golden scenario with
-  `--auto-approve` (via the same `graph/runner.run_incident()` main.py
-  uses -- pulled into a shared module specifically because milestone 5
-  needed a second, non-interactive caller) and prints an accuracy table:
-  top-1 hypothesis id/confidence, whether it's correct, whether the time
-  window widened exactly when the scenario expects it to (not just "at
-  least"), and postmortem-retrieval accuracy where a scenario has one.
-  Grading is deliberately **not** LLM-as-judge -- each scenario JSON now
-  carries an `eval_keywords` fixture (attached by me, the scenario author,
-  before ever seeing what the model would say), and a top-1 hypothesis
-  counts as correct if its description contains any of them. Simple,
-  deterministic, and auditable straight from the printed table -- grading
-  the model with another instance of the same kind of model felt like the
-  wrong tradeoff for a 3-scenario regression check.
-- **Current result: 3/3 top-1 accuracy**, unchanged from the manual
-  verification in milestone 3 -- this just makes it a repeatable one-line
-  command instead of three manual reads of a markdown report.
+### The graph
+
+```mermaid
+flowchart TD
+    normalize_alert --> fetch_metrics
+    normalize_alert --> fetch_logs
+    normalize_alert --> fetch_deploys
+    normalize_alert --> search_postmortems
+    widen_time_window --> fetch_metrics
+    widen_time_window --> fetch_logs
+    widen_time_window --> fetch_deploys
+    widen_time_window --> search_postmortems
+    fetch_metrics --> assess_evidence
+    fetch_logs --> assess_evidence
+    fetch_deploys --> assess_evidence
+    search_postmortems --> assess_evidence
+    assess_evidence -- insufficient, not yet widened --> widen_time_window
+    assess_evidence -- proceed --> generate_hypotheses
+    generate_hypotheses --> rank_hypotheses
+    rank_hypotheses --> human_approval_gate
+    human_approval_gate -- reject, not yet reinvestigated --> generate_hypotheses
+    human_approval_gate -- accept / pick_other / reject-twice --> finalize_report
+    finalize_report --> END((END))
+```
+
+The topology is fixed and known ahead of time — every edge above is decided at build time, not delegated to an agent to figure out at runtime. That's the main reason this is a LangGraph `StateGraph` rather than a multi-agent framework like CrewAI: CrewAI earns its keep when *who does what next* is genuinely emergent; here it never is. Two loops exist, and both are capped at exactly one iteration by a dedicated boolean guard on state (`time_window_widened`, `reinvestigated`) — a scenario that still can't resolve even after the retry terminates instead of looping forever.
+
+### Node reference
+
+| Node | Rule-based or LLM | What it does |
+|---|---|---|
+| `normalize_alert` | rule-based | Parses the raw alert payload into `service_name`, `alert_summary`, and an initial `time_window` (30 min before the alert to 5 min after). |
+| `fetch_metrics` | rule-based | Queries 5 standard metrics (`cpu_usage_pct`, `memory_usage_mb`, `error_rate_pct`, `latency_p99_ms`, `kafka_consumer_lag`) over the current window; flags a metric anomalous if its peak is ≥2× its window-start value. |
+| `fetch_logs` | rule-based | Searches logs/traces for the service in the current window; `WARN`/`ERROR`/`CRITICAL` lines are marked notable, `INFO` lines are kept but not notable. |
+| `fetch_deploys` | rule-based | Lists deploys/merged PRs for the service in the current window. |
+| `search_postmortems` | vector search (Chroma) | Embeds the alert summary and retrieves the top 3 most similar past postmortems; a hit is notable only above a 0.3 cosine-similarity floor. |
+| `assess_evidence` | rule-based | Metrics-only check: is *any* metric notable? Decides whether the window needs widening. |
+| `widen_time_window` | rule-based | Widens the window to 8 hours before the alert (from the default 30 minutes) and re-triggers the four fetch nodes. Fires at most once. |
+| `generate_hypotheses` | **LLM** (`reasoning_model`, default `gpt-4o`) | Reads all gathered evidence and drafts 3–6 root-cause hypotheses, each with a confidence, cited supporting/contradicting evidence ids, and a next diagnostic step. |
+| `rank_hypotheses` | **LLM** (`ranking_model`, default `gpt-4o-mini`) | Re-derives supporting/contradicting evidence for each hypothesis from scratch and assigns a final, rubric-anchored confidence. Cheaper/faster model than generation — see [Technology choices](#technology-choices). |
+| `human_approval_gate` | no-op (pause point) | Execution literally pauses *before* this node runs (`interrupt_before`). All the real work — reading the paused state, prompting a human, writing the decision back — happens outside the graph, in `main.py`/`scripts/eval_scenarios.py`. |
+| `finalize_report` | rule-based | Renders the full markdown incident report: alert, window, all evidence (unfiltered — see [Evidence design](#evidence-design-what-the-llm-sees-vs-what-a-human-sees)), ranked hypotheses, and the human's decision. |
+
+Why the rule-based/LLM split lands where it does: the alert payload is already structured, metrics are numeric time series, and log levels are an explicit field — a threshold or field check does those jobs deterministically, cheaply, and testably. The LLM is reserved for what a rule genuinely can't do: reasoning about *why* several independent, sometimes-contradictory signals point somewhere, and producing a ranked hypothesis with a real causal argument. This split is also why every node up through `assess_evidence`/`widen_time_window` needs no API key at all — that boundary is deliberate, not incidental.
+
+### State shape (`graph/state.py`)
+
+`IncidentState` is a `TypedDict` (LangGraph works cleanest with one) carrying:
+
+- **Alert context**: `alert_raw`, `alert_summary`, `service_name`, `time_window`, `time_window_widened`
+- **Evidence**, one list per source: `metrics_evidence`, `logs_evidence`, `deploy_evidence`, `postmortem_evidence` — each a list of `Evidence` (pydantic): `id` (e.g. `"deploys-0"`, stable so a hypothesis can cite it precisely), `source`, `summary`, `raw_ref`, `is_notable`.
+- **Hypotheses**: `hypotheses` (draft, from `generate_hypotheses`) and `ranked_hypotheses` (final, from `rank_hypotheses`) — both lists of `Hypothesis` (pydantic): `id`, `description`, `confidence` (0–1), `supporting_evidence`/`contradicting_evidence` (evidence ids), `recommended_next_step`. Plus `insufficient_evidence_note`, set when the model can't cleanly distinguish hypotheses.
+- **Human gate**: `human_approved`, `human_decision` (`"accept"` / `"pick_other:<id>"` / `"reject"`), `human_feedback` (freeform text on reject), `reinvestigated` (guards the reject loop to one pass).
+- **Output**: `final_report_markdown`.
+
+Evidence and Hypothesis are pydantic `BaseModel`s nested inside the `TypedDict`, not plain dicts — real validation on the two places the LLM populates structured data directly (confidence bounded to `[0, 1]` via `Field(ge=0.0, le=1.0)`, `source` restricted to a `Literal` of the four known sources, etc.), without paying for full pydantic-settings-style config machinery on the whole state object.
+
+Fan-out (`normalize_alert`/`widen_time_window` → the four fetch nodes) writes to four *separate* state keys rather than one shared list behind a custom reducer — there's no write conflict between `metrics_evidence` and `logs_evidence`, so there's nothing a reducer needs to resolve.
+
+---
+
+## Technology choices
+
+- **LangGraph, not CrewAI.** Explained above — fixed topology, not emergent delegation.
+- **Rule-based nodes wherever a rule can do the job**, LLM reserved for genuine reasoning. See the node table.
+- **Chroma + `sentence-transformers` (`all-MiniLM-L6-v2`) for postmortem retrieval, real from day one** — not a dummy. It's a local, no-API-key vector store, so there's no reason to defer it the way the metrics/logs/deploys clients are deferred; a store with dummy or synthetic embeddings wouldn't actually exercise retrieval quality.
+- **Provider-agnostic LLM factory (`graph/llm.py`).** Nodes call `get_chat_model(model_name)` and use LangChain's `.with_structured_output(PydanticModel)` — never a provider SDK directly. `graph/llm.py` is the *only* file that imports `langchain_openai`/`langchain_anthropic`; which one actually runs is controlled entirely by `LLM_PROVIDER=openai|anthropic` in `.env`. This is what let the project switch from the original Claude-based design to OpenAI as a one-line config change, not a rewrite.
+- **Structured output over manual JSON parsing.** `generate_hypotheses`/`rank_hypotheses` get validated Pydantic objects straight back from the model call — no `json.loads` + hand-rolled schema checking.
+- **A rubric-anchored confidence score, not a bare LLM-emitted float.** LLM confidence numbers are notoriously miscalibrated on their own. `rank_hypotheses`'s system prompt spells out four concrete confidence tiers (0.8–1.0 down to 0.0–0.19) with explicit criteria for each, rather than just asking the model to "rate your confidence."
+- **`interrupt_before` + a `MemorySaver` checkpointer for the human gate.** LangGraph's checkpointing is what makes `graph.get_state()` / `graph.update_state()` / resuming with `graph.invoke(None, config)` possible at all — the graph genuinely suspends mid-execution rather than the human step being bolted on as a separate call outside the graph. `MemorySaver` is in-process/in-memory only (see [Known limitations](#known-limitations--things-to-watch-for)); swapping in a persistent checkpointer is a one-line change in `graph/build_graph.py`.
+- **CLI, not a web server.** A FastAPI trigger would need that same checkpointer plus a resume-from-interrupt HTTP endpoint to work with the approval gate — real plumbing beyond a synchronous CLI's blocking `input()`. Given the scope (single session, no multi-tenant use), the CLI is the right amount of complexity for now; the hard part (the checkpointer machinery) is already built, so adding HTTP later is a smaller lift than it would have been from scratch.
+- **LangSmith tracing, entirely config-gated.** `config.py` sets `LANGSMITH_TRACING`/`LANGSMITH_API_KEY`/`LANGSMITH_PROJECT` in `os.environ` only if `LANGSMITH_API_KEY` is non-empty in `.env`; LangChain's chat models then pick up tracing automatically, no code change anywhere else. Leave the key blank and it's a complete no-op. This is observability only — nothing in the app currently reads anything back from LangSmith.
+
+---
+
+## Evidence design: what the LLM sees vs. what a human sees
+
+This distinction is easy to miss and worth being explicit about, because getting it wrong once caused a real hallucination (see below).
+
+`graph/nodes.py`'s `_all_evidence()` builds what actually goes into the `generate_hypotheses`/`rank_hypotheses` prompts. It is **not** the same thing as "every piece of evidence gathered" — `finalize_report` shows the full, unfiltered evidence from every source, for audit purposes, but the LLM prompt is filtered:
+
+- **Metrics**: all of it, notable or not. A metric that "stayed flat — no anomaly" is real negative evidence — it can rule a cause out — so it's kept.
+- **Logs**: all of it, notable or not. An `INFO` line (e.g. "consumer group rebalance triggered") has been directly cited by the model as *contradicting* evidence against a wrong hypothesis in real testing, so it stays too.
+- **Postmortems**: **filtered to `is_notable` only** (similarity ≥ 0.3). A below-threshold vector-search hit is not informative the way a flat metric is — it's corpus noise with no causal claim attached, and it was directly responsible for a hallucinated hypothesis before this filter existed (the model cited a 0.22-similarity, thematically-unrelated postmortem as "supporting evidence" for a root cause that had nothing to do with it, simply because nothing in the prompt distinguished it from a real match).
+
+Two more evidence-design details worth knowing if you're editing prompts:
+
+- **Metric summaries state the window's duration**, e.g. "climbed from 1000 to 2800 over the 8.1-hour window" — not just the before/after values. This is what lets the model tell a gradual, leak-shaped climb apart from a sudden, spike-shaped one; without it, the model has no way to know *why* a metric moved, only that it did, and tends to produce vague, circular hypotheses ("memory usage increased, leading to an OOM kill" — which says nothing a human doesn't already know from the alert itself).
+- **The "a deploy is usually the highest-signal evidence" prior is explicitly conditional on a deploy actually being present in evidence.** An earlier version of this prompt stated that prior unconditionally, and the model took it as license to hypothesize an unlogged deploy even in scenarios where `deploy_evidence` was empty. If you strengthen a prior like this in the future, explicitly state what it does and doesn't license — a plausible-sounding narrative is not the same thing as a cited evidence item, and the prompt now says so directly for both `generate_hypotheses` and `rank_hypotheses`.
+
+---
+
+## Repo layout
+
+```
+clients/
+  base.py                  Abstract interfaces (MetricsClient, LogsClient, DeployClient, PostmortemStore)
+  scenario_loader.py       Loads a synthetic_incidents/*.json, resolves relative offsets to absolute timestamps
+  prometheus_dummy.py      Dummy Prometheus client -- generates series from a scenario's baseline/pattern/peak spec
+  splunk_dynatrace_dummy.py  Dummy logs/traces client
+  github_dummy.py          Dummy deploy client
+  postmortem_store.py      Chroma + sentence-transformers -- the one real (non-dummy) client
+data/
+  synthetic_incidents/     3 golden scenarios (see "Testing & evaluation" below)
+  postmortems/             4 postmortems: 1 real match + 3 distractors, shared across all scenarios
+graph/
+  state.py                 IncidentState, Evidence, Hypothesis
+  nodes.py                 All node functions, including the generate_hypotheses/rank_hypotheses prompts
+  llm.py                   Provider-agnostic chat model factory (OpenAI/Anthropic)
+  build_graph.py           StateGraph wiring: fan-out/fan-in, both conditional loops, checkpointer + interrupt_before
+  runner.py                Shared invoke/get_state/update_state/resume loop (used by main.py and the eval harness)
+scripts/
+  eval_scenarios.py        Runs every golden scenario non-interactively, prints an accuracy table
+main.py                    CLI entrypoint (interactive or --auto-approve)
+config.py                  Settings: dummy_mode (unused, see below), llm_provider, API keys, model names
+.chroma/                   Chroma's on-disk index (gitignored, rebuilt automatically if missing/stale)
+```
+
+---
+
+## Testing & evaluation
+
+### The three golden scenarios
+
+Each scenario in `data/synthetic_incidents/` is a JSON fixture describing an alert, a metrics pattern (baseline + anomaly window + peak — resolved into a synthetic time series at run time, not hand-authored points), a handful of log lines and deploys at relative offsets from the alert, a `correct_root_cause`/`correct_root_cause_summary` (the ground truth), and `eval_keywords` (see below). All timestamps are **relative to the alert**, resolved to absolute ISO timestamps only when the scenario is loaded — so a scenario reused for regression testing always looks equally fresh, instead of drifting stale the way a fixture with baked-in absolute dates would.
+
+| Scenario | Tests | Correct root cause |
+|---|---|---|
+| `kafka_consumer_lag_deploy` | Deploy evidence correctly identified as root cause over its own downstream symptom (schema-registry timeouts) | A deploy (`deploy`) |
+| `downstream_dependency_outage` | No deploy exists; postmortem retrieval finds a real historical match; the model doesn't blame the service itself for a dependency's failure | A downstream dependency (`downstream_dependency`) |
+| `resource_exhaustion_slow_leak` | The `widen_time_window` loop actually fires — the default 30-minute window shows a flat plateau, only visible as a climb once widened to 8 hours | A slow resource leak (`resource_exhaustion`) |
+
+### Running the eval harness
+
+```bash
+python -m scripts.eval_scenarios              # all 3 scenarios
+python -m scripts.eval_scenarios --scenario kafka_consumer_lag_deploy
+```
+
+It runs each scenario with an auto-approve callback (via the same `graph/runner.run_incident()` that `main.py` uses) and prints:
 
 ```
 scenario                        root cause             top1  conf   correct  window  postmortem
@@ -94,206 +175,46 @@ resource_exhaustion_slow_leak   resource_exhaustion    h1    0.80   YES      ok 
 Top-1 accuracy: 3/3
 ```
 
-**Milestone 6: the scenario 3 investigation the roadmap called for turned up three real bugs, not one.**
-Started from the known issue: scenario 3's hallucinated Kafka hypothesis. Root cause traced to
-`_all_evidence()` (the helper that builds the LLM prompt) never filtering by `is_notable` at all --
-a below-threshold postmortem hit (0.22 similarity, well under the 0.3 "notable" cutoff) was shown to
-the model with no signal distinguishing it from a real match, and it got cited as supporting evidence
-for a hypothesis about a service that has nothing to do with Kafka. **Fixed:** `_all_evidence()` now
-filters `postmortem_evidence` to `is_notable` only, while `finalize_report` still shows every hit
-(the report stays a full audit trail; only the LLM's input got cleaner). Metrics and logs are
-deliberately *not* filtered the same way -- a flat metric or an INFO log carries real negative-evidence
-value ("error rate stayed flat" rules something out); a low-similarity vector-search hit doesn't carry
-an equivalent signal, it's just corpus noise.
+**How grading works, and its real limits.** Grading is deliberately *not* LLM-as-judge — evaluating the system with another instance of the same kind of model felt like the wrong tradeoff for a 3-scenario check, and it would add a second source of non-determinism on top of the first. Instead, each scenario carries an `eval_keywords` fixture attached before ever seeing what the model says, and a top-1 hypothesis counts as correct if its description contains any of them. This is simple and fully auditable from the printed table — but it is a substring match on English text, and it has a real, demonstrated failure mode: a `resource_exhaustion_slow_leak` keyword list that included generic words like `"memory"`/`"oom"` once let a wrong hypothesis ("a workload spike caused higher memory usage," not a leak) pass grading purely because those words also appear in the *alert itself*. Any new scenario's `eval_keywords` should be specific enough to actually discriminate the correct causal story from a plausible-sounding wrong one — not just co-occur with the alert text. Periodically sampling a few raw hypothesis descriptions by hand (not just trusting the YES/NO column) is still worth doing.
 
-Fixing that surfaced a second, more serious hallucination that had been hiding in plain sight: with the
-Kafka distractor gone, scenario 3's *top-ranked* hypothesis (0.80 confidence) started confidently
-claiming "a recent deploy introduced a memory leak" -- despite `deploy_evidence` being empty for that
-scenario. Traced to the milestone 3 prompt fix itself: telling the model "a deploy is usually the
-highest-signal evidence" as an unconditional prior, with no explicit carve-out for "and if there's no
-deploy evidence at all, don't invent one." **Fixed:** reworded both `generate_hypotheses` and
-`rank_hypotheses`'s prompts to make the deploy-prior conditional on a deploy actually being present in
-evidence, and added an explicit rule that "deploys are usually the cause" is not permission to assume
-an unlogged one happened. Also caught that the eval harness's own keyword grading missed this --
-"memory" and "oom" are so generic (the alert itself says "OOM killed") that a wrong hypothesis passed
-grading anyway. Tightened `resource_exhaustion_slow_leak`'s `eval_keywords` to require an actual
-leak-shaped word (`leak`, `gradual`, `steadily accumul`, `growing over`), not just any word that
-happens to co-occur with the alert.
+### Testing the human approval gate interactively
 
-With both hallucinations gone, a third, subtler problem was still visible under the new stricter
-grading: scenario 3's top hypothesis would sometimes land on a phrase like "excessive memory usage...
-leading to an OOM kill" -- technically not wrong, but circular (it says nothing a human doesn't already
-know from the alert itself). Root cause: `fetch_metrics`'s evidence summaries never stated the window's
-*duration*, only the before/after values ("climbed from 1000 to 2800 within the window") -- so the
-model had no way to know a climb was gradual (leak-shaped) rather than sudden (spike-shaped), which is
-exactly the distinction that matters here since scenario 3 specifically widens the window to 8 hours to
-make a slow leak visible at all. **Fixed:** metric summaries now state the window span
-("...over the 8.1-hour window"), and the prompt explicitly asks the model to read window duration as a
-signal about failure mode. Verified across 5 fresh runs post-fix: 5/5 correctly identified "a memory
-leak... climbing steadily over 8.1 hours" as the top hypothesis, versus roughly half vague/wrong before.
-
-**Full regression, post-fix:** 3/3 top-1 accuracy across 3 separate full eval-harness runs (9/9 total),
-under the tightened grading criteria -- stronger evidence of stability than the single run milestone 3
-originally reported on.
-
-Milestones 1-2 still need **zero API key** (every node through
-`assess_evidence`/`widen_time_window` is rule-based). Milestone 3 adds the
-project's first real LLM calls — `generate_hypotheses` (`gpt-4o` by
-default) and `rank_hypotheses` (`gpt-4o-mini`) — via `graph/llm.py`, a
-provider-agnostic factory so `LLM_PROVIDER=openai|anthropic` in `.env` is a
-config change, not a code change.
-
-**Milestone 2 results** (still hold, unaffected by Milestone 3):
-- **kafka_consumer_lag_deploy**: metrics correctly isolate `kafka_consumer_lag`
-  as the only anomaly; deploy evidence surfaces the actual root-cause PR;
-  postmortem search finds the closest thematic match (schema-registry, 0.39)
-  without a fabricated "exact match."
-- **downstream_dependency_outage**: no deploy evidence (correctly empty);
-  postmortem search finds the real match at 0.61 similarity, clearly
-  separated from distractors at 0.41/0.32.
-- **resource_exhaustion_slow_leak**: the widen loop actually fires. The
-  default 30-minute window shows memory as a flat plateau (a 30-minute
-  slice near the end of a 6-hour linear climb has a peak/start ratio of
-  ~1.06 — under the anomaly threshold by construction), so
-  `evidence_sufficient` comes back `False`, the graph widens to 8 hours,
-  re-fetches, and *then* the same metric shows `climbed from 1000 to 2800`.
-  Confirmed via the report's `(widened)` tag and a clean, single loop
-  (`time_window_widened` guards against ever widening twice).
-
-**Milestone 3: the prompt-tuning story the design doc anticipated (§11:
-"get scenario 1 to a reliably correct top-1 hypothesis before moving to
-scenario 2/3").** The first real run of `generate_hypotheses`/
-`rank_hypotheses` against scenario 1 got it wrong: it ranked "schema-registry
-timeouts are happening" (a symptom) at confidence 0.80, *above* "the deploy
-caused the timeouts" (the actual root cause) at 0.50 — treating the deploy
-and its own downstream symptom as two independent, competing hypotheses
-instead of one causal chain. Fixed by adding explicit root-cause-vs-symptom
-guidance to both prompts: a deploy whose diff explains a symptom elsewhere
-in the evidence should absorb that symptom as *supporting* evidence, not
-compete with it. Re-verified: all three scenarios now correctly rank the
-true root cause first (0.80–0.90 confidence), including scenario 2's
-downstream-dependency case and scenario 3's memory leak.
-
-One thing this surfaced that was left open at the time: scenario 3 also
-generated a hypothesis blaming "a recent Kafka schema registry change" with
-*zero* supporting evidence cited — nothing in that scenario's data mentions
-Kafka at all. Correctly ranked last (0.20) so it didn't corrupt the top-1
-result, but worth investigating properly rather than dismissing as noise —
-see Milestone 6 below, which traced and fixed the actual root cause (and
-found two more hallucinations hiding behind it).
-
-`ranking_model` = `gpt-4o-mini` held up fine across all three scenarios —
-a first real answer to the design doc's own open question (§13: is a
-cheaper/faster model good enough for the mechanical cross-checking pass?).
-
-## Design decisions (v1 review)
-
-The original design doc was strong going in — it already anticipated its
-own failure modes (recency bias in ranking, over-confident hypotheses,
-scenario-driven not random dummy data). A few things were pushed back on
-and resolved before building:
-
-- **LangGraph over CrewAI** — confirmed, not changed. This is a DAG with a
-  fixed, known topology decided up front, not a dynamic-delegation problem.
-  CrewAI earns its keep when *who does what* is emergent; here every edge
-  is already specified.
-- **The `widen_time_window` conditional edge is real from Milestone 2**,
-  not deferred as a stretch goal (see the resource_exhaustion_slow_leak
-  result above) — the original doc's milestone 4 required all three golden
-  scenarios passing, but scenario 3 specifically needs that loop-back edge.
-  Deferring it would have meant retrofitting a loop into a graph built
-  linear, which is real rework compared to building it in from the start.
-- **`normalize_alert` and `fetch_metrics` are rule-based, not LLM calls.**
-  The dummy alert payload is already structured, and metrics are numeric
-  time series — both are jobs a threshold rule does deterministically,
-  cheaply, and testably. The LLM is reserved for genuinely unstructured
-  text (`fetch_logs`'s raw messages are surfaced as-is for now, still no
-  LLM needed there either) and actual reasoning over ambiguous evidence
-  (`generate_hypotheses` / `rank_hypotheses`, milestone 3). Nice side
-  effect: Milestones 1 and 2 both need no API key at all.
-- **`assess_evidence` (milestone 2) is a deliberately narrow, metrics-only
-  proxy for "is there enough here to reason about."** It is not trying to
-  replicate real hypothesis-quality judgment — that's milestone 3's job.
-  Checking only whether *metrics* show something notable is what makes the
-  widen trigger exactly testable against scenario 3, without needing an
-  LLM call to get there.
-- **CLI-only entrypoint for v1.** A FastAPI POST trigger needs a
-  checkpointer plus a separate resume-from-interrupt endpoint to work with
-  `human_approval_gate` — real added plumbing the original doc didn't
-  spell out. Given the explicit scope (single session, no multi-tenant),
-  CLI's blocking `input()` is the right amount of complexity for now.
-- **Confidence scores need a rubric, not a bare float.** LLM-emitted 0–1
-  confidence numbers are notoriously uncalibrated. `rank_hypotheses`
-  anchors confidence to explicit criteria (§ RANK_HYPOTHESES_SYSTEM_PROMPT
-  in `graph/nodes.py`) instead of asking the model to just emit a number.
-- **LLM provider is a config toggle, not a hardcoded import.** The design
-  doc specified Claude; the actual key available when Milestone 3 got built
-  was OpenAI's. `graph/llm.py` is the only place that imports a provider
-  SDK — nodes call `get_chat_model(model_name)` and never know which
-  vendor they're talking to, same swap-without-touching-node-logic
-  philosophy as the dummy clients. `LLM_PROVIDER=openai|anthropic` in
-  `.env` is the whole switch.
-- **Named TriageGraph**, not "Ops Genie" — that's Atlassian's actual
-  commercial product (Opsgenie); no reason to collide even for a local
-  project.
-
-## Project layout
-
-```
-clients/
-  base.py                    abstract interfaces (MetricsClient, LogsClient, DeployClient, PostmortemStore)
-  scenario_loader.py          loads a synthetic_incidents/*.json, resolves relative offsets to absolute timestamps
-  prometheus_dummy.py          scenario-driven dummy Prometheus client
-  splunk_dynatrace_dummy.py     scenario-driven dummy logs/traces client
-  github_dummy.py                scenario-driven dummy deploy client
-  postmortem_store.py            Chroma + sentence-transformers, real from day one (it's local anyway)
-data/
-  synthetic_incidents/            3 golden scenarios -- see design doc §7
-  postmortems/                     4 postmortems: 1 real match (scenario 2) + 3 distractors, shared across all scenarios
-graph/
-  state.py                         IncidentState, Evidence, Hypothesis
-  nodes.py                          node functions, including generate_hypotheses/rank_hypotheses prompts
-  llm.py                             provider-agnostic chat model factory (OpenAI/Anthropic)
-  build_graph.py                    StateGraph wiring: fan-out/fan-in, widen_time_window loop, human_approval_gate
-                                     (interrupt_before + MemorySaver checkpointer)
-  runner.py                         shared invoke/get_state/update_state/resume loop (main.py + eval_scenarios.py)
-scripts/
-  eval_scenarios.py                 milestone 5 eval harness -- runs all golden scenarios, prints accuracy table
-main.py                            CLI entrypoint
-config.py                          Settings (dummy_mode, llm_provider, API keys, active_scenario)
-.chroma/                            Chroma's on-disk index (gitignored, rebuilt automatically if missing/stale)
+```bash
+python main.py --scenario kafka_consumer_lag_deploy
 ```
 
-## Scenario data is scenario-driven, not random
+After ranking, it pauses and prompts:
 
-Each scenario JSON defines its story as compact patterns (baseline +
-anomaly window + peak for metrics; offset-from-alert for log lines and
-deploys) rather than hand-written time-series points, with all timestamps
-**relative** ("20 minutes before the alert") and resolved to absolute
-timestamps at run time, anchored to the alert. Anchoring to relative time
-rather than baking absolute timestamps into the JSON is deliberate — a
-golden scenario reused for regression testing should look equally fresh
-whenever you run it.
+```
+  1) Accept top hypothesis
+  2) Pick a different hypothesis
+  3) Reject all -- re-investigate with feedback
+```
 
-The postmortem corpus is shared across all three scenarios rather than
-reseeded per-scenario (the design doc's own recommendation, §13) — a store
-with only the one relevant doc in it wouldn't actually test retrieval
-quality, just whether Chroma returns anything at all. Confirmed doing real
-work: scenario 2's true match retrieves at 0.61 similarity, clearly
-separated from unrelated distractors at 0.41 and 0.32.
+Try each path across separate runs. `2` asks which hypothesis id to pick — the report then shows both the model's original top pick and the human's actual choice, without silently reordering `ranked_hypotheses` (so the report never blurs what the model ranked with what the human decided). `3` asks for feedback text, folds it into a second `generate_hypotheses` pass, and shows the gate again with the revised ranking; rejecting a *second* time in the same run terminates instead of looping again, producing a report that says to escalate to a human on-call.
 
-## Roadmap
+### LLM non-determinism
 
-All 6 originally-planned milestones are done. Ideas for what's next, not yet committed to:
+Even at `temperature=0`, wording and confidence scores vary somewhat between runs of the same scenario — the eval harness table above is not bit-for-bit reproducible, and shouldn't be treated as if it is. A single run passing is weak evidence; several runs passing consistently is what actually indicates a fix held (this is why every prompt fix documented in this codebase was verified across multiple repeated runs, not one).
 
-- **Real client swap** — flip `dummy_mode` and wire real Prometheus/Splunk/Dynatrace/GitHub credentials
-  into the existing abstract client interfaces (`clients/base.py`). The whole point of that abstraction
-  was to make this a constructor change, not a rewrite -- worth actually proving that out.
-- **A second, independent eval signal** — `eval_keywords` grading is honest about what it can't catch
-  (it caught the "workload spike" false-correct case only after manual tightening, by hand, after
-  noticing it in a sampled run -- it wouldn't have caught a *new* wrong-but-keyword-matching phrasing).
-  An LLM-as-judge pass, used as a second, disagreeing-from-the-generator signal rather than a
-  replacement for keyword grading, could catch what keywords structurally can't.
-- **FastAPI trigger** — deferred in the original v1 review pending a checkpointer + resume-from-interrupt
-  endpoint; milestone 4 built exactly that machinery for the CLI, so the remaining gap is just the
-  HTTP layer now, not the hard part.
+---
+
+## Known limitations / things to watch for
+
+- **`dummy_mode` in `config.py` is currently unused.** The abstract client interfaces in `clients/base.py` exist specifically to make a real Prometheus/Splunk/GitHub client a constructor-level swap later, but no real implementation exists yet, and `graph/nodes.py` imports the `Dummy*` clients directly — flipping the flag today does nothing. Wiring a real client in is the natural next step to actually prove the abstraction out.
+- **The `MemorySaver` checkpointer is in-process memory only.** State from a paused (`interrupt_before`) run does not survive the Python process exiting, and isn't shared across processes. Fine for a single CLI invocation; would need a persistent checkpointer (e.g. `SqliteSaver`) for anything longer-lived or multi-process.
+- **CLI-only.** No HTTP trigger exists. `input()` blocks synchronously at the approval gate.
+- **Eval grading is keyword-based, not semantic.** See "How grading works" above — it can be gamed by coincidental word overlap with the alert text if a scenario's `eval_keywords` aren't chosen carefully, and it says nothing about hypothesis *quality* beyond correctness (a correct-but-circular hypothesis and a correct-and-well-reasoned one grade identically).
+- **Real LLM calls cost money.** Every scenario run makes at least two calls (`generate_hypotheses` + `rank_hypotheses`, more if a reject or widen loop fires) against whichever model `reasoning_model`/`ranking_model` in `config.py` point at.
+- **LangSmith tracing is observability-only.** Nothing in the app currently reads anything back from a LangSmith project — no dataset-based eval, no online scoring.
+- **The postmortem corpus is tiny (4 documents) and shared across all three scenarios.** Retrieval quality (0.61 similarity for a real match, clearly separated from ~0.2–0.4 distractors, in current testing) hasn't been stress-tested against a larger, noisier corpus.
+- **Prompt changes have had non-obvious side effects before.** Strengthening the root-cause-vs-symptom guidance in `generate_hypotheses`'s prompt fixed a real ranking bug, but also — unintentionally — made the model willing to hypothesize a deploy that didn't exist in evidence, until a follow-up fix made that prior explicitly conditional (see [Evidence design](#evidence-design-what-the-llm-sees-vs-what-a-human-sees)). Any future prompt edit should be re-verified against all three golden scenarios, across multiple runs, not just the scenario it was written to fix.
+
+---
+
+## Extending this
+
+- **Add a new golden scenario**: drop a new JSON into `data/synthetic_incidents/` following the existing shape (`alert`, `metrics`, `logs`, `deploys`, `correct_root_cause`, `correct_root_cause_summary`, `eval_keywords`, optionally `postmortem_match`) — `scripts/eval_scenarios.py` picks it up automatically.
+- **Switch LLM provider**: set `LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` in `.env` — no code change.
+- **Wire a real client**: implement `clients/base.py`'s `MetricsClient`/`LogsClient`/`DeployClient` against a real Prometheus/Splunk/GitHub API, then point `graph/nodes.py`'s `fetch_metrics`/`fetch_logs`/`fetch_deploys` at it (currently a direct import of the `Dummy*` class — this is exactly where a `dummy_mode`-driven factory would go).
+- **Add an HTTP trigger**: the checkpointer + `interrupt_before` machinery `human_approval_gate` relies on already exists; a FastAPI layer would need a POST-to-start endpoint and a separate resume-from-interrupt endpoint calling the same `graph/runner.py` primitives `main.py` uses today.
