@@ -49,6 +49,7 @@ flowchart TD
     finalize_report --> END((END))
 
     style human_approval_gate fill:#f8d7da,stroke:#c0392b,stroke-width:2px,color:#721c24
+    style widen_time_window fill:#fff3cd,stroke:#b8860b,stroke-width:2px,color:#664d03
 ```
 
 The topology is fixed and known ahead of time — every edge above is decided at build time, not delegated to an agent to figure out at runtime. That's the main reason this is a LangGraph `StateGraph` rather than a multi-agent framework like CrewAI: CrewAI earns its keep when *who does what next* is genuinely emergent; here it never is. Two loops exist, and both are capped at exactly one iteration by a dedicated boolean guard on state (`time_window_widened`, `reinvestigated`) — a scenario that still can't resolve even after the retry terminates instead of looping forever.
