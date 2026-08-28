@@ -12,7 +12,7 @@ This is **v1** — the design doc (linked internally) was reviewed and
 adjusted before building; see "Design decisions" below for what changed and
 why.
 
-## Status: Milestone 5 (tracing + eval harness) — done
+## Status: Milestone 6 (postmortem filtering + hallucination fixes) — done
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -94,6 +94,48 @@ resource_exhaustion_slow_leak   resource_exhaustion    h1    0.80   YES      ok 
 Top-1 accuracy: 3/3
 ```
 
+**Milestone 6: the scenario 3 investigation the roadmap called for turned up three real bugs, not one.**
+Started from the known issue: scenario 3's hallucinated Kafka hypothesis. Root cause traced to
+`_all_evidence()` (the helper that builds the LLM prompt) never filtering by `is_notable` at all --
+a below-threshold postmortem hit (0.22 similarity, well under the 0.3 "notable" cutoff) was shown to
+the model with no signal distinguishing it from a real match, and it got cited as supporting evidence
+for a hypothesis about a service that has nothing to do with Kafka. **Fixed:** `_all_evidence()` now
+filters `postmortem_evidence` to `is_notable` only, while `finalize_report` still shows every hit
+(the report stays a full audit trail; only the LLM's input got cleaner). Metrics and logs are
+deliberately *not* filtered the same way -- a flat metric or an INFO log carries real negative-evidence
+value ("error rate stayed flat" rules something out); a low-similarity vector-search hit doesn't carry
+an equivalent signal, it's just corpus noise.
+
+Fixing that surfaced a second, more serious hallucination that had been hiding in plain sight: with the
+Kafka distractor gone, scenario 3's *top-ranked* hypothesis (0.80 confidence) started confidently
+claiming "a recent deploy introduced a memory leak" -- despite `deploy_evidence` being empty for that
+scenario. Traced to the milestone 3 prompt fix itself: telling the model "a deploy is usually the
+highest-signal evidence" as an unconditional prior, with no explicit carve-out for "and if there's no
+deploy evidence at all, don't invent one." **Fixed:** reworded both `generate_hypotheses` and
+`rank_hypotheses`'s prompts to make the deploy-prior conditional on a deploy actually being present in
+evidence, and added an explicit rule that "deploys are usually the cause" is not permission to assume
+an unlogged one happened. Also caught that the eval harness's own keyword grading missed this --
+"memory" and "oom" are so generic (the alert itself says "OOM killed") that a wrong hypothesis passed
+grading anyway. Tightened `resource_exhaustion_slow_leak`'s `eval_keywords` to require an actual
+leak-shaped word (`leak`, `gradual`, `steadily accumul`, `growing over`), not just any word that
+happens to co-occur with the alert.
+
+With both hallucinations gone, a third, subtler problem was still visible under the new stricter
+grading: scenario 3's top hypothesis would sometimes land on a phrase like "excessive memory usage...
+leading to an OOM kill" -- technically not wrong, but circular (it says nothing a human doesn't already
+know from the alert itself). Root cause: `fetch_metrics`'s evidence summaries never stated the window's
+*duration*, only the before/after values ("climbed from 1000 to 2800 within the window") -- so the
+model had no way to know a climb was gradual (leak-shaped) rather than sudden (spike-shaped), which is
+exactly the distinction that matters here since scenario 3 specifically widens the window to 8 hours to
+make a slow leak visible at all. **Fixed:** metric summaries now state the window span
+("...over the 8.1-hour window"), and the prompt explicitly asks the model to read window duration as a
+signal about failure mode. Verified across 5 fresh runs post-fix: 5/5 correctly identified "a memory
+leak... climbing steadily over 8.1 hours" as the top hypothesis, versus roughly half vague/wrong before.
+
+**Full regression, post-fix:** 3/3 top-1 accuracy across 3 separate full eval-harness runs (9/9 total),
+under the tightened grading criteria -- stronger evidence of stability than the single run milestone 3
+originally reported on.
+
 Milestones 1-2 still need **zero API key** (every node through
 `assess_evidence`/`widen_time_window` is rule-based). Milestone 3 adds the
 project's first real LLM calls — `generate_hypotheses` (`gpt-4o` by
@@ -132,13 +174,13 @@ compete with it. Re-verified: all three scenarios now correctly rank the
 true root cause first (0.80–0.90 confidence), including scenario 2's
 downstream-dependency case and scenario 3's memory leak.
 
-One thing this surfaced that's still open, not fixed: scenario 3 also
+One thing this surfaced that was left open at the time: scenario 3 also
 generated a hypothesis blaming "a recent Kafka schema registry change" with
 *zero* supporting evidence cited — nothing in that scenario's data mentions
-Kafka at all. It's correctly ranked last (0.20), so it doesn't corrupt the
-top-1 result, but a hypothesis with no cited evidence shouldn't have been
-generated per the prompt's own instructions ("do not assume a cause not
-supported by the evidence provided"). Worth watching if it recurs.
+Kafka at all. Correctly ranked last (0.20) so it didn't corrupt the top-1
+result, but worth investigating properly rather than dismissing as noise —
+see Milestone 6 below, which traced and fixed the actual root cause (and
+found two more hallucinations hiding behind it).
 
 `ranking_model` = `gpt-4o-mini` held up fine across all three scenarios —
 a first real answer to the design doc's own open question (§13: is a
@@ -242,8 +284,16 @@ separated from unrelated distractors at 0.41 and 0.32.
 
 ## Roadmap
 
-- **Milestone 6** — postmortem reranking polish; investigate the scenario 3
-  hallucinated Kafka hypothesis noted above (it's evolved: earlier it cited
-  zero evidence, the latest run instead misused an unrelated postmortem as
-  "supporting" evidence -- still harmless since it's ranked last, but worth
-  understanding before calling milestone 3's reasoning nodes fully settled).
+All 6 originally-planned milestones are done. Ideas for what's next, not yet committed to:
+
+- **Real client swap** — flip `dummy_mode` and wire real Prometheus/Splunk/Dynatrace/GitHub credentials
+  into the existing abstract client interfaces (`clients/base.py`). The whole point of that abstraction
+  was to make this a constructor change, not a rewrite -- worth actually proving that out.
+- **A second, independent eval signal** — `eval_keywords` grading is honest about what it can't catch
+  (it caught the "workload spike" false-correct case only after manual tightening, by hand, after
+  noticing it in a sampled run -- it wouldn't have caught a *new* wrong-but-keyword-matching phrasing).
+  An LLM-as-judge pass, used as a second, disagreeing-from-the-generator signal rather than a
+  replacement for keyword grading, could catch what keywords structurally can't.
+- **FastAPI trigger** — deferred in the original v1 review pending a checkpointer + resume-from-interrupt
+  endpoint; milestone 4 built exactly that machinery for the CLI, so the remaining gap is just the
+  HTTP layer now, not the hard part.

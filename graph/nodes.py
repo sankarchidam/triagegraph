@@ -94,12 +94,27 @@ def normalize_alert(state: IncidentState) -> dict:
     }
 
 
+def _format_window_span(start: str, end: str) -> str:
+    """Human-readable window duration for evidence summaries. This is the
+    signal that distinguishes a gradual trend from a sudden one -- a metric
+    that "climbed from X to Y" reads very differently over a 30-minute
+    window than over an 8-hour one, but until milestone 6 that duration
+    never made it into the LLM prompt at all, only the before/after values.
+    Found while investigating why scenario 3 (a slow leak, specifically
+    widened to 8 hours to make the gradual climb visible) sometimes got a
+    vague "excessive memory usage" hypothesis instead of "memory leak" --
+    the model had no way to know the climb was gradual rather than sudden."""
+    minutes = (datetime.datetime.fromisoformat(end) - datetime.datetime.fromisoformat(start)).total_seconds() / 60
+    return f"{minutes:.0f}-minute" if minutes < 90 else f"{minutes / 60:.1f}-hour"
+
+
 def fetch_metrics(state: IncidentState) -> dict:
     scenario = load_scenario_for_state(state)
     alert_time = datetime.datetime.fromisoformat(state["alert_raw"]["timestamp"])
     client = DummyPrometheusClient(scenario, alert_time)
 
     start, end = state["time_window"]
+    window_span = _format_window_span(start, end)
     evidence: list[Evidence] = []
 
     for i, query in enumerate(STANDARD_METRIC_QUERIES):
@@ -124,7 +139,7 @@ def fetch_metrics(state: IncidentState) -> dict:
             evidence.append(Evidence(
                 id=f"metrics-{i}",
                 source="metrics",
-                summary=f"{query} climbed from {window_start_value:g} to {peak_value:g} within the window",
+                summary=f"{query} climbed from {window_start_value:g} to {peak_value:g} over the {window_span} window",
                 raw_ref=f"promql:{query}",
                 is_notable=True,
             ))
@@ -235,11 +250,31 @@ def route_after_assessment(state: IncidentState) -> str:
 # ---------------------------------------------------------------------------
 
 def _all_evidence(state: IncidentState) -> list[Evidence]:
+    """Evidence surfaced to the LLM. Deliberately NOT the same thing as "all
+    evidence gathered" -- see finalize_report, which does show every
+    postmortem hit for audit purposes. is_notable means different things
+    per source, and only some of those meanings are informative to show a
+    reasoning model:
+
+    - metrics: a flat/non-anomalous metric is real negative evidence ("error
+      rate stayed flat" rules a cause out) -- keep all of it.
+    - logs: an INFO line can be real negative evidence too (e.g. "consumer
+      group rebalance triggered" was cited as *contradicting* a hypothesis
+      in milestone 3's testing) -- keep all of it.
+    - postmortems: a below-threshold vector-search hit is NOT negative
+      evidence the way a flat metric is -- it's just embedding noise from a
+      small corpus, with no causal claim attached at all. Milestone 6 found
+      the model treating a 0.22-similarity distractor postmortem as
+      supporting evidence for a hallucinated hypothesis, because nothing in
+      the prompt distinguished it from a real match. Filtered here instead
+      of at the prompt-wording level, so there's no distinction left to be
+      missed.
+    """
     return [
         *state.get("metrics_evidence", []),
         *state.get("logs_evidence", []),
         *state.get("deploy_evidence", []),
-        *state.get("postmortem_evidence", []),
+        *[e for e in state.get("postmortem_evidence", []) if e.is_notable],
     ]
 
 
@@ -272,14 +307,28 @@ GENERATE_HYPOTHESES_SYSTEM_PROMPT = """You are an SRE incident analyst. You are 
 to four sources: metrics, logs, recent deploys, and similar past incidents (postmortems). Each evidence item has a \
 stable id like "deploys-0" -- cite these ids exactly when referencing evidence, never invent new ones.
 
-Distinguish root cause from symptom. A deploy or config change is usually the highest-signal evidence available -- \
-most incidents correlate with a recent change. If a deploy's diff plausibly explains a pattern you see elsewhere in \
-the evidence (e.g. a new client with a timeout that matches observed timeout errors, or a schema change that matches \
-a deserialization failure), that match makes the deploy MORE likely to be the root cause, not less -- the matching \
-symptom is supporting evidence FOR the deploy hypothesis, not a separate, independently-ranked hypothesis competing \
-against it. Only generate a symptom as its own standalone hypothesis if no deploy or change plausibly explains it.
+Metric evidence states the window it climbed over, e.g. "over the 8.1-hour window" vs "over the 30-minute window" -- \
+that duration is a real signal about the failure mode, not incidental phrasing. A metric climbing steadily over \
+hours reads as a gradual/cumulative cause (a leak, an unbounded cache, slow accumulation); the same climb inside a \
+tight few-minute window reads as sudden (a spike, a step change, a released deploy). Use it to sharpen a vague \
+symptom restatement (e.g. "memory usage increased" says nothing a human doesn't already know from the alert) into \
+an actual mechanism (e.g. "a gradual leak, evidenced by a steady climb over N hours" says something new).
 
-Do not assume a cause not supported by the evidence provided. Generate 3-6 distinct hypotheses. For each:
+Distinguish root cause from symptom. IF a deploy or config change is present in the evidence below, treat it as \
+the highest-signal evidence available -- most incidents that DO have a recent change correlate with it. If a \
+deploy's diff plausibly explains a pattern you see elsewhere in the evidence (e.g. a new client with a timeout that \
+matches observed timeout errors, or a schema change that matches a deserialization failure), that match makes the \
+deploy MORE likely to be the root cause, not less -- the matching symptom is supporting evidence FOR the deploy \
+hypothesis, not a separate, independently-ranked hypothesis competing against it. Only generate a symptom as its \
+own standalone hypothesis if no deploy or change plausibly explains it.
+
+If there is NO deploy evidence listed below at all, do not hypothesize one anyway -- "deploys are usually the cause" \
+is a prior about incidents that have a deploy in evidence, not permission to assume an unlogged one happened. An \
+empty deploy list is itself informative: it rules deploys out, it doesn't leave them open as a guess.
+
+Do not assume a cause not supported by the evidence provided -- this includes assuming a *type* of cause (a deploy, \
+a config change) that has no corresponding evidence item, even if that type is a common root cause in general. \
+Generate 3-6 distinct hypotheses. For each:
 - a one-sentence description
 - an initial confidence (0-1) based on how directly the evidence supports it
 - the evidence ids that support it, and the evidence ids that contradict it (most hypotheses will have some of each -- \
@@ -352,7 +401,10 @@ full evidence list below -- don't just repeat what was there before. Then assign
 
 - 0.8-1.0: at least one directly correlated, unambiguous causal link (e.g. a deploy whose diff plausibly explains \
 the failure mode, or a downstream dependency failure exactly matching the timing) with no meaningful contradicting \
-evidence.
+evidence. A "deploy caused this" hypothesis can only reach this tier if you can cite a real deploys-N id for it in \
+supporting_evidence -- if the full evidence list below has no deploy evidence item at all, that hypothesis has no \
+causal link to cite and cannot score here no matter how plausible its narrative reads; score it 0.2-0.49 or lower \
+and note the missing evidence in contradicting_evidence.
 - 0.5-0.79: a plausible mechanism with real supporting evidence, but either a gap in the causal chain or at least \
 one unaddressed contradiction.
 - 0.2-0.49: weak or circumstantial correlation only, or meaningfully contradicted by other evidence.

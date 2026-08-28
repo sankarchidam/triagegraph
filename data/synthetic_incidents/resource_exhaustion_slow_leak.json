@@ -5,7 +5,7 @@
   "correct_root_cause_summary": "A slow memory leak climbed for roughly 6 hours before the alert; the OOM kill at alert time is the symptom, not the start of the story. No deploy and no downstream dependency issue caused this.",
   "service_name": "recommendations-worker",
   "requires_widened_window": true,
-  "eval_keywords": ["memory leak", "memory", "leak", "oom"],
+  "eval_keywords": ["leak", "gradual", "steadily accumul", "growing over"],
 
   "alert": {
     "alert_name": "RecommendationsWorkerOOMKilled",
