@@ -29,6 +29,19 @@ update_state / resume). Reject routes back to generate_hypotheses with
 human_feedback folded into the prompt -- capped at one re-investigation
 pass via the `reinvestigated` flag, the same one-shot-loop pattern as
 widen_time_window/time_window_widened.
+
+fetch_upstream_health adds dependency-graph awareness: how healthy are
+the services this one depends on, up to MAX_UPSTREAM_HOPS hops out. Rule-
+based, like the other fetch nodes -- walking a topology graph and reading
+a status flag needs no LLM. Distance is deliberately NOT a hard filter or
+a deterministic score here: hop_distance is surfaced as a structured fact
+on the Evidence item, and the actual weighing (closer is usually more
+likely, but not always -- see the prompts) is left to generate_hypotheses/
+rank_hypotheses, the same way root-cause-vs-symptom reasoning about
+deploys was. An unconditional prose prior has caused two real hallucination
+bugs in this codebase already (see README's "Evidence design" section) --
+this prompt is written to state the prior's limits from the start, not
+patch them in after the fact.
 """
 from __future__ import annotations
 
@@ -42,6 +55,7 @@ from clients.github_dummy import DummyGithubClient
 from clients.postmortem_store import ChromaPostmortemStore
 from clients.prometheus_dummy import DummyPrometheusClient
 from clients.scenario_loader import load_scenario
+from clients.service_topology_dummy import DummyServiceHealthClient
 from clients.splunk_dynatrace_dummy import DummyLogsClient
 from config import settings
 from graph.llm import get_chat_model
@@ -62,6 +76,12 @@ STANDARD_METRIC_QUERIES = ["cpu_usage_pct", "memory_usage_mb", "error_rate_pct",
 # client swap-in later can replace this with a proper z-score/seasonality
 # check without touching the node's control flow.
 ANOMALY_RATIO_THRESHOLD = 2.0
+
+# How many dependency hops out fetch_upstream_health walks. 2 matches the
+# motivating case (immediate upstream + its immediate upstream); deeper
+# graphs get noisy/high-fan-out fast, and this is a prior for the LLM to
+# weigh, not a claim that anything beyond this distance is irrelevant.
+MAX_UPSTREAM_HOPS = 2
 
 DEFAULT_WINDOW_BEFORE = datetime.timedelta(minutes=30)
 DEFAULT_WINDOW_AFTER = datetime.timedelta(minutes=5)
@@ -214,6 +234,32 @@ def search_postmortems(state: IncidentState) -> dict:
     return {"postmortem_evidence": evidence}
 
 
+def fetch_upstream_health(state: IncidentState) -> dict:
+    scenario = load_scenario_for_state(state)
+    client = DummyServiceHealthClient(scenario)
+    hops = client.get_upstream_health(state["service_name"], max_hops=MAX_UPSTREAM_HOPS)
+
+    evidence = []
+    for i, hop in enumerate(hops):
+        is_degraded = hop["status"] == "degraded"
+        plural = "s" if hop["hop_distance"] != 1 else ""
+        detail = f" -- {hop['detail']}" if hop.get("detail") else ""
+        evidence.append(Evidence(
+            id=f"upstream-{i}",
+            source="upstream_health",
+            summary=(
+                f"{hop['service']} ({hop['hop_distance']} hop{plural} upstream of {state['service_name']}): "
+                f"{'DEGRADED' if is_degraded else 'healthy'}{detail}"
+            ),
+            raw_ref=f"service:{hop['service']}",
+            hop_distance=hop["hop_distance"],
+            # Healthy upstreams are kept, not dropped -- "checked, it's fine" rules a
+            # cause out, same reasoning as a flat metric. Only degraded ones are notable.
+            is_notable=is_degraded,
+        ))
+    return {"upstream_evidence": evidence}
+
+
 def assess_evidence(state: IncidentState) -> dict:
     """Narrow, metrics-only mechanical proxy for "is there enough here to
     reason about" -- deliberately not an LLM call, since it has to run
@@ -269,11 +315,15 @@ def _all_evidence(state: IncidentState) -> list[Evidence]:
       the prompt distinguished it from a real match. Filtered here instead
       of at the prompt-wording level, so there's no distinction left to be
       missed.
+    - upstream_health: same reasoning as metrics/logs, not postmortems -- a
+      healthy upstream ("checked payment-gateway, it's fine") rules a cause
+      out just as validly as a flat metric does. Keep all of it.
     """
     return [
         *state.get("metrics_evidence", []),
         *state.get("logs_evidence", []),
         *state.get("deploy_evidence", []),
+        *state.get("upstream_evidence", []),
         *[e for e in state.get("postmortem_evidence", []) if e.is_notable],
     ]
 
@@ -304,8 +354,9 @@ class GeneratedHypotheses(BaseModel):
 
 
 GENERATE_HYPOTHESES_SYSTEM_PROMPT = """You are an SRE incident analyst. You are given normalized evidence from up \
-to four sources: metrics, logs, recent deploys, and similar past incidents (postmortems). Each evidence item has a \
-stable id like "deploys-0" -- cite these ids exactly when referencing evidence, never invent new ones.
+to five sources: metrics, logs, recent deploys, upstream service health, and similar past incidents (postmortems). \
+Each evidence item has a stable id like "deploys-0" -- cite these ids exactly when referencing evidence, never \
+invent new ones.
 
 Metric evidence states the window it climbed over, e.g. "over the 8.1-hour window" vs "over the 30-minute window" -- \
 that duration is a real signal about the failure mode, not incidental phrasing. A metric climbing steadily over \
@@ -325,6 +376,15 @@ own standalone hypothesis if no deploy or change plausibly explains it.
 If there is NO deploy evidence listed below at all, do not hypothesize one anyway -- "deploys are usually the cause" \
 is a prior about incidents that have a deploy in evidence, not permission to assume an unlogged one happened. An \
 empty deploy list is itself informative: it rules deploys out, it doesn't leave them open as a guess.
+
+Upstream health evidence is tagged with a hop distance (e.g. "1 hop upstream", "2 hops upstream" of the alerting \
+service). Treat distance as a prior, not a rule: a DEGRADED service 1 hop away is, all else equal, a more likely \
+root cause than one 2 hops away, because failures are usually dampened as they propagate through timeouts and \
+retries at each hop. But this prior can be wrong. If the 1-hop service is itself DEGRADED with no independent \
+explanation of its own (i.e. nothing else in the evidence explains why the 1-hop service would be unhealthy on its \
+own), and a 2-hop service is also DEGRADED, treat the 1-hop service as a symptom the 2-hop service's failure is \
+passing through undampened -- the same root-cause-vs-symptom reasoning you apply to deploys. Do not discard a \
+farther-hop DEGRADED service just because it's farther away; weigh it, don't filter it out.
 
 Do not assume a cause not supported by the evidence provided -- this includes assuming a *type* of cause (a deploy, \
 a config change) that has no corresponding evidence item, even if that type is a common root cause in general. \
@@ -416,6 +476,12 @@ the same or lower -- it explains everything the symptom-only hypothesis explains
 hypothesis outrank the deploy that plausibly caused it just because the symptom's evidence is more voluminous \
 (e.g. more log lines) -- volume of evidence for a symptom isn't the same as it being the root cause.
 
+Same reasoning applies to upstream health hop distance: a hypothesis blaming a 1-hop-upstream DEGRADED service is a \
+stronger default candidate than one blaming a 2-hop-upstream DEGRADED service, all else equal -- but if the 1-hop \
+service has no independent explanation for its own degradation while a 2-hop service is also DEGRADED, the 1-hop \
+service is a symptom passing the 2-hop failure through, and the 2-hop hypothesis should score higher, not lower, \
+for being farther away. Don't apply the distance prior as a hard rule when the evidence itself contradicts it.
+
 Update recommended_next_step if the re-examination suggests a better diagnostic step. Return one entry per input \
 hypothesis id -- don't drop or add hypotheses at this stage."""
 
@@ -490,6 +556,7 @@ def finalize_report(state: IncidentState) -> dict:
         ("Metrics evidence", "metrics_evidence"),
         ("Logs evidence", "logs_evidence"),
         ("Deploy evidence", "deploy_evidence"),
+        ("Upstream health evidence", "upstream_evidence"),
         ("Postmortem evidence", "postmortem_evidence"),
     ]:
         items = state.get(key, [])

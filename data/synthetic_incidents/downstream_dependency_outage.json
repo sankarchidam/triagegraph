@@ -6,6 +6,10 @@
   "service_name": "checkout-service",
   "requires_widened_window": false,
   "eval_keywords": ["payment-gateway", "payment gateway", "downstream"],
+  "upstream_health": {
+    "payment-gateway": {"status": "degraded", "detail": "elevated error rate and connection timeouts on payment authorization calls"},
+    "card-network-gateway": "healthy"
+  },
 
   "alert": {
     "alert_name": "CheckoutServiceErrorRateHigh",

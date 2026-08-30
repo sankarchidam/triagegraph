@@ -6,6 +6,10 @@
   "service_name": "orders-consumer",
   "requires_widened_window": false,
   "eval_keywords": ["deploy", "pr #482", "avro", "schema-registry", "schema registry", "deserializ"],
+  "upstream_health": {
+    "schema-registry": "healthy",
+    "kafka-broker": "healthy"
+  },
 
   "alert": {
     "alert_name": "KafkaConsumerLagHigh",

@@ -15,15 +15,22 @@ the paused state, prompts a human, writes the decision back via
 graph.update_state(), and resumes. Reject routes back to
 generate_hypotheses for one feedback-driven re-investigation pass.
 
-Fan-out uses four separate state keys (metrics_evidence, logs_evidence,
-deploy_evidence, postmortem_evidence) rather than a shared reducer -- the
-design doc's own recommendation (§5.2): no reducer complexity needed when
-there's no write conflict to begin with.
+fetch_upstream_health joins the fan-out as a fifth fetch node: how healthy
+are this service's upstream dependencies (see clients/service_topology_dummy.py).
+Rule-based like the others -- walking a topology graph and reading a status
+flag needs no LLM; the actual weighing of hop distance is left to
+generate_hypotheses/rank_hypotheses's prompts.
+
+Fan-out uses five separate state keys (metrics_evidence, logs_evidence,
+deploy_evidence, postmortem_evidence, upstream_evidence) rather than a
+shared reducer -- the design doc's own recommendation (§5.2): no reducer
+complexity needed when there's no write conflict to begin with.
 
 Shape:
 
     normalize_alert
-        -> [fetch_metrics, fetch_logs, fetch_deploys, search_postmortems]  (fan-out)
+        -> [fetch_metrics, fetch_logs, fetch_deploys, search_postmortems,
+            fetch_upstream_health]                                        (fan-out)
         -> assess_evidence                                                 (fan-in)
              -- conditional --
              insufficient, not yet widened -> widen_time_window -> fan-out again (loop, once)
@@ -43,6 +50,7 @@ from graph.nodes import (
     fetch_deploys,
     fetch_logs,
     fetch_metrics,
+    fetch_upstream_health,
     finalize_report,
     generate_hypotheses,
     human_approval_gate,
@@ -55,7 +63,7 @@ from graph.nodes import (
 )
 from graph.state import IncidentState
 
-FETCH_NODES = ["fetch_metrics", "fetch_logs", "fetch_deploys", "search_postmortems"]
+FETCH_NODES = ["fetch_metrics", "fetch_logs", "fetch_deploys", "search_postmortems", "fetch_upstream_health"]
 
 
 def build_graph():
@@ -66,6 +74,7 @@ def build_graph():
     graph.add_node("fetch_logs", fetch_logs)
     graph.add_node("fetch_deploys", fetch_deploys)
     graph.add_node("search_postmortems", search_postmortems)
+    graph.add_node("fetch_upstream_health", fetch_upstream_health)
     graph.add_node("assess_evidence", assess_evidence)
     graph.add_node("widen_time_window", widen_time_window)
     graph.add_node("generate_hypotheses", generate_hypotheses)

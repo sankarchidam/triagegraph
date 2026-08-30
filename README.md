@@ -1,6 +1,6 @@
 # TriageGraph
 
-An agentic incident-triage copilot built on [LangGraph](https://langchain-ai.github.io/langgraph/). Give it an alert and it fans out across metrics, logs, recent deploys, and past postmortems, reasons over all four with an LLM, and produces a ranked, evidence-cited root-cause hypothesis tree — pausing for a human's sign-off before anything is treated as "actioned." It currently runs entirely on localhost against scenario-driven synthetic data (no real Prometheus/Splunk/GitHub account needed), with the data layer built behind abstract interfaces specifically so real credentials can be dropped in later.
+An agentic incident-triage copilot built on [LangGraph](https://langchain-ai.github.io/langgraph/). Give it an alert and it fans out across metrics, logs, recent deploys, upstream service health, and past postmortems, reasons over all five with an LLM, and produces a ranked, evidence-cited root-cause hypothesis tree — pausing for a human's sign-off before anything is treated as "actioned." It currently runs entirely on localhost against scenario-driven synthetic data (no real Prometheus/Splunk/GitHub account needed), with the data layer built behind abstract interfaces specifically so real credentials can be dropped in later.
 
 This document is meant to be sufficient on its own: architecture, why it's built the way it is, how to run and test it, and what to watch out for. It does not track development history — read the git log for that.
 
@@ -36,6 +36,7 @@ flowchart TD
         fetch_logs
         fetch_deploys
         search_postmortems
+        fetch_upstream_health
     end
 
     fanout --> assess_evidence
@@ -53,6 +54,7 @@ flowchart TD
     style fetch_logs fill:#cfe2ff,stroke:#084298,stroke-width:2px,color:#084298
     style fetch_deploys fill:#cfe2ff,stroke:#084298,stroke-width:2px,color:#084298
     style search_postmortems fill:#cfe2ff,stroke:#084298,stroke-width:2px,color:#084298
+    style fetch_upstream_health fill:#cfe2ff,stroke:#084298,stroke-width:2px,color:#084298
     style fanout fill:#eef5ff,stroke:#a8c8f0,stroke-width:1px
     style assess_evidence fill:#e2d9f3,stroke:#6f42c1,stroke-width:2px,color:#432874
     style widen_time_window fill:#fff3cd,stroke:#b8860b,stroke-width:2px,color:#664d03
@@ -67,13 +69,13 @@ Color = what kind of action the node performs, not which milestone added it:
 | Color | Action | Nodes |
 |---|---|---|
 | ⚪ gray | Ingest / output — parse in, render out | `normalize_alert`, `finalize_report` |
-| 🔵 blue | Gather — rule-based fetch from one evidence source | `fetch_metrics`, `fetch_logs`, `fetch_deploys`, `search_postmortems` |
+| 🔵 blue | Gather — rule-based fetch from one evidence source | `fetch_metrics`, `fetch_logs`, `fetch_deploys`, `search_postmortems`, `fetch_upstream_health` |
 | 🟣 purple | Decide — rule-based check that picks a branch | `assess_evidence` |
 | 🟠 amber | Redirect — widens scope and retries, capped at once | `widen_time_window` |
 | 🟢 green | Reason — an actual LLM call | `generate_hypotheses`, `rank_hypotheses` |
 | 🔴 red | Human gate — execution pauses for a person | `human_approval_gate` |
 
-The four fetch nodes are grouped in the unlabeled blue box above — they run in parallel, all fed by `normalize_alert` (or `widen_time_window` on the retry loop), and all fan back into `assess_evidence`. They're drawn as one visual group rather than eight separate crossing arrows purely for legibility; in the actual graph each of the four has its own independent edge in both directions (see `graph/build_graph.py`).
+The five fetch nodes are grouped in the unlabeled blue box above — they run in parallel, all fed by `normalize_alert` (or `widen_time_window` on the retry loop), and all fan back into `assess_evidence`. They're drawn as one visual group rather than ten separate crossing arrows purely for legibility; in the actual graph each of the five has its own independent edge in both directions (see `graph/build_graph.py`).
 
 The topology is fixed and known ahead of time — every edge above is decided at build time, not delegated to an agent to figure out at runtime. That's the main reason this is a LangGraph `StateGraph` rather than a multi-agent framework like CrewAI: CrewAI earns its keep when *who does what next* is genuinely emergent; here it never is. Two loops exist, and both are capped at exactly one iteration by a dedicated boolean guard on state (`time_window_widened`, `reinvestigated`) — a scenario that still can't resolve even after the retry terminates instead of looping forever.
 
@@ -86,8 +88,9 @@ The topology is fixed and known ahead of time — every edge above is decided at
 | `fetch_logs` | rule-based | Searches logs/traces for the service in the current window; `WARN`/`ERROR`/`CRITICAL` lines are marked notable, `INFO` lines are kept but not notable. |
 | `fetch_deploys` | rule-based | Lists deploys/merged PRs for the service in the current window. |
 | `search_postmortems` | vector search (Chroma) | Embeds the alert summary and retrieves the top 3 most similar past postmortems; a hit is notable only above a 0.3 cosine-similarity floor. |
+| `fetch_upstream_health` | rule-based | Walks the service's dependency graph up to 2 hops out (`MAX_UPSTREAM_HOPS`), checking each upstream's health status; tags each with its `hop_distance`. See [Upstream dependency health](#upstream-dependency-health). |
 | `assess_evidence` | rule-based | Metrics-only check: is *any* metric notable? Decides whether the window needs widening. |
-| `widen_time_window` | rule-based | Widens the window to 8 hours before the alert (from the default 30 minutes) and re-triggers the four fetch nodes. Fires at most once. |
+| `widen_time_window` | rule-based | Widens the window to 8 hours before the alert (from the default 30 minutes) and re-triggers the five fetch nodes. Fires at most once. |
 | `generate_hypotheses` | **LLM** (`reasoning_model`, default `gpt-4o`) | Reads all gathered evidence and drafts 3–6 root-cause hypotheses, each with a confidence, cited supporting/contradicting evidence ids, and a next diagnostic step. |
 | `rank_hypotheses` | **LLM** (`ranking_model`, default `gpt-4o-mini`) | Re-derives supporting/contradicting evidence for each hypothesis from scratch and assigns a final, rubric-anchored confidence. Cheaper/faster model than generation — see [Technology choices](#technology-choices). |
 | `human_approval_gate` | no-op (pause point) | Execution literally pauses *before* this node runs (`interrupt_before`). All the real work — reading the paused state, prompting a human, writing the decision back — happens outside the graph, in `main.py`/`scripts/eval_scenarios.py`. |
@@ -100,14 +103,14 @@ Why the rule-based/LLM split lands where it does: the alert payload is already s
 `IncidentState` is a `TypedDict` (LangGraph works cleanest with one) carrying:
 
 - **Alert context**: `alert_raw`, `alert_summary`, `service_name`, `time_window`, `time_window_widened`
-- **Evidence**, one list per source: `metrics_evidence`, `logs_evidence`, `deploy_evidence`, `postmortem_evidence` — each a list of `Evidence` (pydantic): `id` (e.g. `"deploys-0"`, stable so a hypothesis can cite it precisely), `source`, `summary`, `raw_ref`, `is_notable`.
+- **Evidence**, one list per source: `metrics_evidence`, `logs_evidence`, `deploy_evidence`, `postmortem_evidence`, `upstream_evidence` — each a list of `Evidence` (pydantic): `id` (e.g. `"deploys-0"`, stable so a hypothesis can cite it precisely), `source`, `summary`, `raw_ref`, `is_notable`, and `hop_distance` (set only on `upstream_health` items).
 - **Hypotheses**: `hypotheses` (draft, from `generate_hypotheses`) and `ranked_hypotheses` (final, from `rank_hypotheses`) — both lists of `Hypothesis` (pydantic): `id`, `description`, `confidence` (0–1), `supporting_evidence`/`contradicting_evidence` (evidence ids), `recommended_next_step`. Plus `insufficient_evidence_note`, set when the model can't cleanly distinguish hypotheses.
 - **Human gate**: `human_approved`, `human_decision` (`"accept"` / `"pick_other:<id>"` / `"reject"`), `human_feedback` (freeform text on reject), `reinvestigated` (guards the reject loop to one pass).
 - **Output**: `final_report_markdown`.
 
-Evidence and Hypothesis are pydantic `BaseModel`s nested inside the `TypedDict`, not plain dicts — real validation on the two places the LLM populates structured data directly (confidence bounded to `[0, 1]` via `Field(ge=0.0, le=1.0)`, `source` restricted to a `Literal` of the four known sources, etc.), without paying for full pydantic-settings-style config machinery on the whole state object.
+Evidence and Hypothesis are pydantic `BaseModel`s nested inside the `TypedDict`, not plain dicts — real validation on the two places the LLM populates structured data directly (confidence bounded to `[0, 1]` via `Field(ge=0.0, le=1.0)`, `source` restricted to a `Literal` of the five known sources, etc.), without paying for full pydantic-settings-style config machinery on the whole state object.
 
-Fan-out (`normalize_alert`/`widen_time_window` → the four fetch nodes) writes to four *separate* state keys rather than one shared list behind a custom reducer — there's no write conflict between `metrics_evidence` and `logs_evidence`, so there's nothing a reducer needs to resolve.
+Fan-out (`normalize_alert`/`widen_time_window` → the five fetch nodes) writes to five *separate* state keys rather than one shared list behind a custom reducer — there's no write conflict between `metrics_evidence` and `logs_evidence`, so there's nothing a reducer needs to resolve.
 
 ---
 
@@ -142,19 +145,35 @@ Two more evidence-design details worth knowing if you're editing prompts:
 
 ---
 
+## Upstream dependency health
+
+The intuition motivating this evidence source: if `C` depends on `B` which depends on `A`, and `C` is alerting, `B` being unhealthy is usually a stronger root-cause candidate than `A` being unhealthy — failures are normally dampened as they propagate through timeouts, retries, and circuit breakers at each hop out. `fetch_upstream_health` walks `data/service_topology.json` (a shared dependency-graph fixture, same "shared corpus, not reseeded per scenario" reasoning as the postmortem store) up to `MAX_UPSTREAM_HOPS` (2, matching the "immediate upstream and their immediate upstream" framing this was scoped to) and tags each upstream service with a `hop_distance` and a health status.
+
+**Distance is a prior for the LLM to weigh, not a deterministic filter or score.** This was a deliberate choice, not the default: the dampening assumption only holds if the intermediate hop actually has working isolation, and this codebase already has a live counterexample to "closer is always the answer" sitting in its own golden data. In `kafka_consumer_lag_deploy`, `orders-consumer`'s logs show schema-registry timeouts — schema-registry is 1 hop upstream. But the real root cause isn't schema-registry being unhealthy (its `upstream_health` entry is `"healthy"`); it's that the deploy added a client with a 3-second timeout and no real protection against a merely-slow upstream. A hard "1-hop issues always win" rule would have pointed at the wrong thing. So both `generate_hypotheses` and `rank_hypotheses` state the prior explicitly *and* state its limit: a farther-hop degraded service whose failure is passing through an intermediate hop undampened should still win on the merits, treating the intermediate hop as a symptom the same way a deploy's downstream symptom is already handled. This mirrors, deliberately, the exact conditional-prior framing that fixed the deploy hallucination in the first place (see above) — writing a new prior's limits into the prompt from day one, instead of discovering the hallucination and patching it in afterward.
+
+**Healthy upstreams are kept as evidence, not dropped.** Same reasoning as metrics/logs, not postmortems: "checked payment-gateway, it's fine" rules a cause out just as validly as a flat metric does.
+
+**Fidelity is deliberately a status flag** (`"healthy"` / `"degraded"` + an optional `detail` string), not a full per-service metrics time series. A richer version of this feature would also compare *onset timing* — did the upstream's anomaly start before this alert did? — which is a stronger causal signal than distance alone, but needs each upstream to have its own time series to compute from. That's a natural follow-on, not built yet; see [Known limitations](#known-limitations--things-to-watch-for).
+
+**Also out of scope**: downstream blast radius (services that depend on *this* one). That's an impact/notification concern — who to page, who to warn — not a root-cause-triage concern, so this stays strictly upstream-facing. And real distributed tracing (span-level causal analysis, what Honeycomb/Dynatrace actually do) is the heavier, gold-standard version of what hop-distance + a health snapshot approximates here — naming it so this isn't mistaken for that.
+
+---
+
 ## Repo layout
 
 ```
 clients/
-  base.py                  Abstract interfaces (MetricsClient, LogsClient, DeployClient, PostmortemStore)
+  base.py                  Abstract interfaces (MetricsClient, LogsClient, DeployClient, PostmortemStore, ServiceHealthClient)
   scenario_loader.py       Loads a synthetic_incidents/*.json, resolves relative offsets to absolute timestamps
   prometheus_dummy.py      Dummy Prometheus client -- generates series from a scenario's baseline/pattern/peak spec
   splunk_dynatrace_dummy.py  Dummy logs/traces client
   github_dummy.py          Dummy deploy client
   postmortem_store.py      Chroma + sentence-transformers -- the one real (non-dummy) client
+  service_topology_dummy.py  Dummy dependency-graph/health client -- see "Upstream dependency health" above
 data/
   synthetic_incidents/     3 golden scenarios (see "Testing & evaluation" below)
   postmortems/             4 postmortems: 1 real match + 3 distractors, shared across all scenarios
+  service_topology.json    Shared dependency graph (who depends on whom); health status lives per-scenario instead
 graph/
   state.py                 IncidentState, Evidence, Hypothesis
   nodes.py                 All node functions, including the generate_hypotheses/rank_hypotheses prompts
@@ -174,13 +193,15 @@ config.py                  Settings: dummy_mode (unused, see below), llm_provide
 
 ### The three golden scenarios
 
-Each scenario in `data/synthetic_incidents/` is a JSON fixture describing an alert, a metrics pattern (baseline + anomaly window + peak — resolved into a synthetic time series at run time, not hand-authored points), a handful of log lines and deploys at relative offsets from the alert, a `correct_root_cause`/`correct_root_cause_summary` (the ground truth), and `eval_keywords` (see below). All timestamps are **relative to the alert**, resolved to absolute ISO timestamps only when the scenario is loaded — so a scenario reused for regression testing always looks equally fresh, instead of drifting stale the way a fixture with baked-in absolute dates would.
+Each scenario in `data/synthetic_incidents/` is a JSON fixture describing an alert, a metrics pattern (baseline + anomaly window + peak — resolved into a synthetic time series at run time, not hand-authored points), a handful of log lines and deploys at relative offsets from the alert, an `upstream_health` map (service → `"healthy"`/`"degraded"`, resolved against the shared `data/service_topology.json` graph), a `correct_root_cause`/`correct_root_cause_summary` (the ground truth), and `eval_keywords` (see below). All timestamps are **relative to the alert**, resolved to absolute ISO timestamps only when the scenario is loaded — so a scenario reused for regression testing always looks equally fresh, instead of drifting stale the way a fixture with baked-in absolute dates would.
 
 | Scenario | Tests | Correct root cause |
 |---|---|---|
-| `kafka_consumer_lag_deploy` | Deploy evidence correctly identified as root cause over its own downstream symptom (schema-registry timeouts) | A deploy (`deploy`) |
-| `downstream_dependency_outage` | No deploy exists; postmortem retrieval finds a real historical match; the model doesn't blame the service itself for a dependency's failure | A downstream dependency (`downstream_dependency`) |
-| `resource_exhaustion_slow_leak` | The `widen_time_window` loop actually fires — the default 30-minute window shows a flat plateau, only visible as a climb once widened to 8 hours | A slow resource leak (`resource_exhaustion`) |
+| `kafka_consumer_lag_deploy` | Deploy evidence correctly identified as root cause over its own downstream symptom (schema-registry timeouts); upstream health shows schema-registry itself as healthy — a negative control against blaming a merely-slow, not-actually-broken upstream | A deploy (`deploy`) |
+| `downstream_dependency_outage` | No deploy exists; postmortem retrieval finds a real historical match; upstream health directly shows payment-gateway (1 hop) degraded, corroborating the log-based signal independently | A downstream dependency (`downstream_dependency`) |
+| `resource_exhaustion_slow_leak` | The `widen_time_window` loop actually fires — the default 30-minute window shows a flat plateau, only visible as a climb once widened to 8 hours; upstream health shows the one dependency as healthy — a self-contained cause, no upstream involved | A slow resource leak (`resource_exhaustion`) |
+
+None of the three golden scenarios currently tests the "distant hop is the actual root cause despite an intermediate hop looking closer" case head-on — see [Known limitations](#known-limitations--things-to-watch-for).
 
 ### Running the eval harness
 
@@ -234,13 +255,17 @@ Even at `temperature=0`, wording and confidence scores vary somewhat between run
 - **Real LLM calls cost money.** Every scenario run makes at least two calls (`generate_hypotheses` + `rank_hypotheses`, more if a reject or widen loop fires) against whichever model `reasoning_model`/`ranking_model` in `config.py` point at.
 - **LangSmith tracing is observability-only.** Nothing in the app currently reads anything back from a LangSmith project — no dataset-based eval, no online scoring.
 - **The postmortem corpus is tiny (4 documents) and shared across all three scenarios.** Retrieval quality (0.61 similarity for a real match, clearly separated from ~0.2–0.4 distractors, in current testing) hasn't been stress-tested against a larger, noisier corpus.
+- **Upstream health is a status flag, not a time series.** There's no way yet to compare an upstream's anomaly *onset* against the alerting service's own onset — a genuinely stronger causal signal than hop distance alone. See "Upstream dependency health" above for what that would take.
+- **No golden scenario yet directly tests the case that motivated this feature**: a distant-hop upstream being degraded *without* real isolation at the intermediate hop, where the correct answer really is the farther one despite the closer-hop prior. The existing scenarios test related but different things (a healthy 1-hop upstream that's a red herring; a genuinely-degraded 1-hop upstream that *is* the answer). Worth adding as a dedicated fourth scenario before trusting the "prior, not filter" prompt guidance under real pressure.
+- **The dependency graph itself (`data/service_topology.json`) is hand-authored and tiny** (8 services, linear 2-hop chains, no cycles or high fan-out exercised). A real service's dependency graph is wider and messier; `DummyServiceHealthClient`'s BFS is written to handle cycles and depth limits correctly, but that's untested against an actually gnarly graph.
 - **Prompt changes have had non-obvious side effects before.** Strengthening the root-cause-vs-symptom guidance in `generate_hypotheses`'s prompt fixed a real ranking bug, but also — unintentionally — made the model willing to hypothesize a deploy that didn't exist in evidence, until a follow-up fix made that prior explicitly conditional (see [Evidence design](#evidence-design-what-the-llm-sees-vs-what-a-human-sees)). Any future prompt edit should be re-verified against all three golden scenarios, across multiple runs, not just the scenario it was written to fix.
 
 ---
 
 ## Extending this
 
-- **Add a new golden scenario**: drop a new JSON into `data/synthetic_incidents/` following the existing shape (`alert`, `metrics`, `logs`, `deploys`, `correct_root_cause`, `correct_root_cause_summary`, `eval_keywords`, optionally `postmortem_match`) — `scripts/eval_scenarios.py` picks it up automatically.
+- **Add a new golden scenario**: drop a new JSON into `data/synthetic_incidents/` following the existing shape (`alert`, `metrics`, `logs`, `deploys`, `upstream_health`, `correct_root_cause`, `correct_root_cause_summary`, `eval_keywords`, optionally `postmortem_match`) — `scripts/eval_scenarios.py` picks it up automatically. A "broken bulkhead" scenario (see [Known limitations](#known-limitations--things-to-watch-for)) is the most valuable one missing right now.
+- **Extend the dependency graph**: add a service and its `upstream` list to `data/service_topology.json`, then reference it in any scenario's `upstream_health` map.
 - **Switch LLM provider**: set `LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` in `.env` — no code change.
-- **Wire a real client**: implement `clients/base.py`'s `MetricsClient`/`LogsClient`/`DeployClient` against a real Prometheus/Splunk/GitHub API, then point `graph/nodes.py`'s `fetch_metrics`/`fetch_logs`/`fetch_deploys` at it (currently a direct import of the `Dummy*` class — this is exactly where a `dummy_mode`-driven factory would go).
+- **Wire a real client**: implement `clients/base.py`'s `MetricsClient`/`LogsClient`/`DeployClient`/`ServiceHealthClient` against a real Prometheus/Splunk/GitHub/service-mesh API, then point `graph/nodes.py`'s corresponding `fetch_*` function at it (currently a direct import of the `Dummy*` class — this is exactly where a `dummy_mode`-driven factory would go).
 - **Add an HTTP trigger**: the checkpointer + `interrupt_before` machinery `human_approval_gate` relies on already exists; a FastAPI layer would need a POST-to-start endpoint and a separate resume-from-interrupt endpoint calling the same `graph/runner.py` primitives `main.py` uses today.

@@ -1,0 +1,12 @@
+{
+  "orders-consumer": {"upstream": ["schema-registry"]},
+  "schema-registry": {"upstream": ["kafka-broker"]},
+  "kafka-broker": {"upstream": []},
+
+  "checkout-service": {"upstream": ["payment-gateway"]},
+  "payment-gateway": {"upstream": ["card-network-gateway"]},
+  "card-network-gateway": {"upstream": []},
+
+  "recommendations-worker": {"upstream": ["feature-store"]},
+  "feature-store": {"upstream": []}
+}

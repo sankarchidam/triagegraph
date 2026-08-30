@@ -6,6 +6,9 @@
   "service_name": "recommendations-worker",
   "requires_widened_window": true,
   "eval_keywords": ["leak", "gradual", "steadily accumul", "growing over"],
+  "upstream_health": {
+    "feature-store": "healthy"
+  },
 
   "alert": {
     "alert_name": "RecommendationsWorkerOOMKilled",

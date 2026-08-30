@@ -16,11 +16,13 @@ from pydantic import BaseModel, Field
 
 class Evidence(BaseModel):
     id: str  # stable short id (e.g. "metrics-0") so a Hypothesis can cite exactly which evidence it means
-    source: Literal["metrics", "logs", "deploys", "postmortems"]
+    source: Literal["metrics", "logs", "deploys", "postmortems", "upstream_health"]
     summary: str
     raw_ref: str  # pointer to raw data: the query used, a log id, a PR number, etc.
     is_notable: bool = True  # False for "checked, nothing unusual" evidence (e.g. a flat metric) --
     # machine-checkable so assess_evidence doesn't have to parse English out of `summary`
+    hop_distance: Optional[int] = None  # set only for source == "upstream_health" -- how many dependency
+    # hops away that service is, so the LLM can weigh it as a structured fact rather than parsed-out prose
 
 
 class Hypothesis(BaseModel):
@@ -43,6 +45,7 @@ class IncidentState(TypedDict):
     logs_evidence: list[Evidence]
     deploy_evidence: list[Evidence]
     postmortem_evidence: list[Evidence]
+    upstream_evidence: list[Evidence]
 
     hypotheses: list[Hypothesis]
     ranked_hypotheses: list[Hypothesis]

@@ -38,3 +38,13 @@ class PostmortemStore(ABC):
     def search(self, query_text: str, k: int = 3) -> list[dict]:
         """Must return a list of {"doc_id": ..., "text": ..., "score": ...}"""
         ...
+
+
+class ServiceHealthClient(ABC):
+    @abstractmethod
+    def get_upstream_health(self, service_name: str, max_hops: int) -> list[dict]:
+        """Must return a list of {"service": ..., "hop_distance": ..., "status": "healthy"|"degraded",
+        "detail": str|None}, one entry per upstream service found within max_hops of service_name.
+        A real implementation would source this from a service mesh's live telemetry, a
+        distributed-tracing system's inferred call graph, or a declared service catalog."""
+        ...
