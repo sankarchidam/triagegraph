@@ -32,8 +32,8 @@ flowchart TD
 
     subgraph fanout[" "]
         direction LR
-        fetch_metrics
         fetch_logs
+        fetch_metrics
         fetch_deploys
         search_postmortems
         fetch_upstream_health
