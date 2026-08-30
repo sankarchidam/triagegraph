@@ -28,19 +28,19 @@ No API key is needed to explore evidence-gathering alone — every node up throu
 
 ```mermaid
 flowchart TD
-    normalize_alert --> fetch_metrics
-    normalize_alert --> fetch_logs
-    normalize_alert --> fetch_deploys
-    normalize_alert --> search_postmortems
-    widen_time_window --> fetch_metrics
-    widen_time_window --> fetch_logs
-    widen_time_window --> fetch_deploys
-    widen_time_window --> search_postmortems
-    fetch_metrics --> assess_evidence
-    fetch_logs --> assess_evidence
-    fetch_deploys --> assess_evidence
-    search_postmortems --> assess_evidence
+    normalize_alert --> fanout
+
+    subgraph fanout[" "]
+        direction LR
+        fetch_metrics
+        fetch_logs
+        fetch_deploys
+        search_postmortems
+    end
+
+    fanout --> assess_evidence
     assess_evidence -- insufficient, not yet widened --> widen_time_window
+    widen_time_window --> fanout
     assess_evidence -- proceed --> generate_hypotheses
     generate_hypotheses --> rank_hypotheses
     rank_hypotheses --> human_approval_gate
@@ -51,6 +51,8 @@ flowchart TD
     style human_approval_gate fill:#f8d7da,stroke:#c0392b,stroke-width:2px,color:#721c24
     style widen_time_window fill:#fff3cd,stroke:#b8860b,stroke-width:2px,color:#664d03
 ```
+
+The four fetch nodes (`fetch_metrics`, `fetch_logs`, `fetch_deploys`, `search_postmortems`) are grouped in the unlabeled box above — they run in parallel, all fed by `normalize_alert` (or `widen_time_window` on the retry loop), and all fan back into `assess_evidence`. They're drawn as one visual group rather than eight separate crossing arrows purely for legibility; in the actual graph each of the four has its own independent edge in both directions (see `graph/build_graph.py`).
 
 The topology is fixed and known ahead of time — every edge above is decided at build time, not delegated to an agent to figure out at runtime. That's the main reason this is a LangGraph `StateGraph` rather than a multi-agent framework like CrewAI: CrewAI earns its keep when *who does what next* is genuinely emergent; here it never is. Two loops exist, and both are capped at exactly one iteration by a dedicated boolean guard on state (`time_window_widened`, `reinvestigated`) — a scenario that still can't resolve even after the retry terminates instead of looping forever.
 
