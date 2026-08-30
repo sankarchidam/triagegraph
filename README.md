@@ -48,11 +48,32 @@ flowchart TD
     human_approval_gate -- accept / pick_other / reject-twice --> finalize_report
     finalize_report --> END((END))
 
-    style human_approval_gate fill:#f8d7da,stroke:#c0392b,stroke-width:2px,color:#721c24
+    style normalize_alert fill:#e2e3e5,stroke:#6c757d,stroke-width:2px,color:#41464b
+    style fetch_metrics fill:#cfe2ff,stroke:#084298,stroke-width:2px,color:#084298
+    style fetch_logs fill:#cfe2ff,stroke:#084298,stroke-width:2px,color:#084298
+    style fetch_deploys fill:#cfe2ff,stroke:#084298,stroke-width:2px,color:#084298
+    style search_postmortems fill:#cfe2ff,stroke:#084298,stroke-width:2px,color:#084298
+    style fanout fill:#eef5ff,stroke:#a8c8f0,stroke-width:1px
+    style assess_evidence fill:#e2d9f3,stroke:#6f42c1,stroke-width:2px,color:#432874
     style widen_time_window fill:#fff3cd,stroke:#b8860b,stroke-width:2px,color:#664d03
+    style generate_hypotheses fill:#d1e7dd,stroke:#146c43,stroke-width:2px,color:#0f5132
+    style rank_hypotheses fill:#d1e7dd,stroke:#146c43,stroke-width:2px,color:#0f5132
+    style human_approval_gate fill:#f8d7da,stroke:#c0392b,stroke-width:2px,color:#721c24
+    style finalize_report fill:#e2e3e5,stroke:#6c757d,stroke-width:2px,color:#41464b
 ```
 
-The four fetch nodes (`fetch_metrics`, `fetch_logs`, `fetch_deploys`, `search_postmortems`) are grouped in the unlabeled box above — they run in parallel, all fed by `normalize_alert` (or `widen_time_window` on the retry loop), and all fan back into `assess_evidence`. They're drawn as one visual group rather than eight separate crossing arrows purely for legibility; in the actual graph each of the four has its own independent edge in both directions (see `graph/build_graph.py`).
+Color = what kind of action the node performs, not which milestone added it:
+
+| Color | Action | Nodes |
+|---|---|---|
+| ⚪ gray | Ingest / output — parse in, render out | `normalize_alert`, `finalize_report` |
+| 🔵 blue | Gather — rule-based fetch from one evidence source | `fetch_metrics`, `fetch_logs`, `fetch_deploys`, `search_postmortems` |
+| 🟣 purple | Decide — rule-based check that picks a branch | `assess_evidence` |
+| 🟠 amber | Redirect — widens scope and retries, capped at once | `widen_time_window` |
+| 🟢 green | Reason — an actual LLM call | `generate_hypotheses`, `rank_hypotheses` |
+| 🔴 red | Human gate — execution pauses for a person | `human_approval_gate` |
+
+The four fetch nodes are grouped in the unlabeled blue box above — they run in parallel, all fed by `normalize_alert` (or `widen_time_window` on the retry loop), and all fan back into `assess_evidence`. They're drawn as one visual group rather than eight separate crossing arrows purely for legibility; in the actual graph each of the four has its own independent edge in both directions (see `graph/build_graph.py`).
 
 The topology is fixed and known ahead of time — every edge above is decided at build time, not delegated to an agent to figure out at runtime. That's the main reason this is a LangGraph `StateGraph` rather than a multi-agent framework like CrewAI: CrewAI earns its keep when *who does what next* is genuinely emergent; here it never is. Two loops exist, and both are capped at exactly one iteration by a dedicated boolean guard on state (`time_window_widened`, `reinvestigated`) — a scenario that still can't resolve even after the retry terminates instead of looping forever.
 
