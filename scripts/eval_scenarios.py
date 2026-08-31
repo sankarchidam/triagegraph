@@ -103,8 +103,13 @@ def main():
             "window_as_expected": state.get("time_window_widened", False) == scenario.get("requires_widened_window", False),
         })
 
+    # Both widths are dynamic, not hardcoded -- a fixed scenario-name width bit us
+    # once already (see git history) when a longer scenario name ran into the next
+    # column. Widening the fixture set shouldn't require remembering to also widen
+    # a magic number here.
+    scenario_width = max(len("scenario"), *(len(r["scenario"]) for r in rows)) + 2
     root_cause_width = max(len("root cause"), *(len(r["correct_root_cause"]) for r in rows)) + 2
-    header = f"{'scenario':<32}{'root cause':<{root_cause_width}}{'top1':<6}{'conf':<7}{'correct':<9}{'window':<8}postmortem"
+    header = f"{'scenario':<{scenario_width}}{'root cause':<{root_cause_width}}{'top1':<6}{'conf':<7}{'correct':<9}{'window':<8}postmortem"
     print("\n" + "=" * len(header))
     print(header)
     print("-" * len(header))
@@ -113,7 +118,7 @@ def main():
         if r["top1_correct"]:
             n_correct += 1
         print(
-            f"{r['scenario']:<32}{r['correct_root_cause']:<{root_cause_width}}{r['top1_id']:<6}{r['top1_confidence']:<7}"
+            f"{r['scenario']:<{scenario_width}}{r['correct_root_cause']:<{root_cause_width}}{r['top1_id']:<6}{r['top1_confidence']:<7}"
             f"{'YES' if r['top1_correct'] else 'NO':<9}{'ok' if r['window_as_expected'] else 'FAIL':<8}{r['postmortem']}"
         )
     print("-" * len(header))

@@ -8,5 +8,9 @@
   "card-network-gateway": {"upstream": []},
 
   "recommendations-worker": {"upstream": ["feature-store"]},
-  "feature-store": {"upstream": []}
+  "feature-store": {"upstream": []},
+
+  "billing-service": {"upstream": ["auth-service"]},
+  "auth-service": {"upstream": ["identity-provider"]},
+  "identity-provider": {"upstream": []}
 }

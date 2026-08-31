@@ -15,7 +15,7 @@ cp .env.example .env          # fill in OPENAI_API_KEY (or ANTHROPIC_API_KEY + L
 
 python main.py --scenario kafka_consumer_lag_deploy          # interactive: prompts you at the approval gate
 python main.py --scenario kafka_consumer_lag_deploy --auto-approve --out report.md
-python -m scripts.eval_scenarios                              # runs all 3 golden scenarios, prints an accuracy table
+python -m scripts.eval_scenarios                              # runs all 4 golden scenarios, prints an accuracy table
 ```
 
 No API key is needed to explore evidence-gathering alone — every node up through `assess_evidence`/`widen_time_window` is rule-based. A key is only required once execution reaches `generate_hypotheses` (see [Architecture](#architecture)).
@@ -151,6 +151,8 @@ The intuition motivating this evidence source: if `C` depends on `B` which depen
 
 **Distance is a prior for the LLM to weigh, not a deterministic filter or score.** This was a deliberate choice, not the default: the dampening assumption only holds if the intermediate hop actually has working isolation, and this codebase already has a live counterexample to "closer is always the answer" sitting in its own golden data. In `kafka_consumer_lag_deploy`, `orders-consumer`'s logs show schema-registry timeouts — schema-registry is 1 hop upstream. But the real root cause isn't schema-registry being unhealthy (its `upstream_health` entry is `"healthy"`); it's that the deploy added a client with a 3-second timeout and no real protection against a merely-slow upstream. A hard "1-hop issues always win" rule would have pointed at the wrong thing. So both `generate_hypotheses` and `rank_hypotheses` state the prior explicitly *and* state its limit: a farther-hop degraded service whose failure is passing through an intermediate hop undampened should still win on the merits, treating the intermediate hop as a symptom the same way a deploy's downstream symptom is already handled. This mirrors, deliberately, the exact conditional-prior framing that fixed the deploy hallucination in the first place (see above) — writing a new prior's limits into the prompt from day one, instead of discovering the hallucination and patching it in afterward.
 
+This is now golden-tested directly, not just argued for: `upstream_cascade_broken_bulkhead` puts a *2-hop* service (`identity-provider`) as the true root cause behind a *1-hop* service (`auth-service`) that's also degraded but has no independent explanation of its own — a real broken bulkhead (no timeout/circuit-breaker between the two). The model correctly named the 2-hop service, not the closer one, across 12/12 runs. See "The four golden scenarios" below.
+
 **Healthy upstreams are kept as evidence, not dropped.** Same reasoning as metrics/logs, not postmortems: "checked payment-gateway, it's fine" rules a cause out just as validly as a flat metric does.
 
 **Fidelity is deliberately a status flag** (`"healthy"` / `"degraded"` + an optional `detail` string), not a full per-service metrics time series. A richer version of this feature would also compare *onset timing* — did the upstream's anomaly start before this alert did? — which is a stronger causal signal than distance alone, but needs each upstream to have its own time series to compute from. That's a natural follow-on, not built yet; see [Known limitations](#known-limitations--things-to-watch-for).
@@ -171,7 +173,7 @@ clients/
   postmortem_store.py      Chroma + sentence-transformers -- the one real (non-dummy) client
   service_topology_dummy.py  Dummy dependency-graph/health client -- see "Upstream dependency health" above
 data/
-  synthetic_incidents/     3 golden scenarios (see "Testing & evaluation" below)
+  synthetic_incidents/     4 golden scenarios (see "Testing & evaluation" below)
   postmortems/             4 postmortems: 1 real match + 3 distractors, shared across all scenarios
   service_topology.json    Shared dependency graph (who depends on whom); health status lives per-scenario instead
 graph/
@@ -191,7 +193,7 @@ config.py                  Settings: dummy_mode (unused, see below), llm_provide
 
 ## Testing & evaluation
 
-### The three golden scenarios
+### The four golden scenarios
 
 Each scenario in `data/synthetic_incidents/` is a JSON fixture describing an alert, a metrics pattern (baseline + anomaly window + peak — resolved into a synthetic time series at run time, not hand-authored points), a handful of log lines and deploys at relative offsets from the alert, an `upstream_health` map (service → `"healthy"`/`"degraded"`, resolved against the shared `data/service_topology.json` graph), a `correct_root_cause`/`correct_root_cause_summary` (the ground truth), and `eval_keywords` (see below). All timestamps are **relative to the alert**, resolved to absolute ISO timestamps only when the scenario is loaded — so a scenario reused for regression testing always looks equally fresh, instead of drifting stale the way a fixture with baked-in absolute dates would.
 
@@ -200,29 +202,31 @@ Each scenario in `data/synthetic_incidents/` is a JSON fixture describing an ale
 | `kafka_consumer_lag_deploy` | Deploy evidence correctly identified as root cause over its own downstream symptom (schema-registry timeouts); upstream health shows schema-registry itself as healthy — a negative control against blaming a merely-slow, not-actually-broken upstream | A deploy (`deploy`) |
 | `downstream_dependency_outage` | No deploy exists; postmortem retrieval finds a real historical match; upstream health directly shows payment-gateway (1 hop) degraded, corroborating the log-based signal independently | A downstream dependency (`downstream_dependency`) |
 | `resource_exhaustion_slow_leak` | The `widen_time_window` loop actually fires — the default 30-minute window shows a flat plateau, only visible as a climb once widened to 8 hours; upstream health shows the one dependency as healthy — a self-contained cause, no upstream involved | A slow resource leak (`resource_exhaustion`) |
+| `upstream_cascade_broken_bulkhead` | The case that motivated hop-distance weighting in the first place: `identity-provider` (2 hops upstream) is genuinely degraded; `auth-service` (1 hop upstream, structurally the "closer, more suspicious" candidate) is *also* marked degraded but has no independent explanation of its own — a broken bulkhead (no timeout/circuit-breaker) passing the 2-hop failure through undampened. Correctly resolving this means overriding the closer-hop prior on the evidence, not applying it as a rule. | A transitive upstream cascade (`upstream_cascade`) |
 
-None of the three golden scenarios currently tests the "distant hop is the actual root cause despite an intermediate hop looking closer" case head-on — see [Known limitations](#known-limitations--things-to-watch-for).
+Verified stable across repeated runs: `upstream_cascade_broken_bulkhead` picked `identity-provider` over the closer `auth-service` correctly in 12/12 separate runs (5 direct + 3 full eval-harness passes) before this was considered settled — a "farther-hop, prior-overriding" case is exactly the kind of edge that's worth distrusting on a single green run.
 
 ### Running the eval harness
 
 ```bash
-python -m scripts.eval_scenarios              # all 3 scenarios
+python -m scripts.eval_scenarios              # all 4 scenarios
 python -m scripts.eval_scenarios --scenario kafka_consumer_lag_deploy
 ```
 
 It runs each scenario with an auto-approve callback (via the same `graph/runner.run_incident()` that `main.py` uses) and prints:
 
 ```
-scenario                        root cause             top1  conf   correct  window  postmortem
---------------------------------------------------------------------------------------------------
-downstream_dependency_outage    downstream_dependency  h1    0.90   YES      ok      OK (downstream_payment_gateway_outage)
-kafka_consumer_lag_deploy       deploy                 h1    0.90   YES      ok      n/a
-resource_exhaustion_slow_leak   resource_exhaustion    h1    0.80   YES      ok      n/a
---------------------------------------------------------------------------------------------------
-Top-1 accuracy: 3/3
+scenario                          root cause             top1  conf   correct  window  postmortem
+-------------------------------------------------------------------------------------------------
+downstream_dependency_outage      downstream_dependency  h1    0.90   YES      ok      OK (downstream_payment_gateway_outage)
+kafka_consumer_lag_deploy         deploy                 h1    0.90   YES      ok      n/a
+resource_exhaustion_slow_leak     resource_exhaustion    h1    0.80   YES      ok      n/a
+upstream_cascade_broken_bulkhead  upstream_cascade       h1    0.90   YES      ok      n/a
+-------------------------------------------------------------------------------------------------
+Top-1 accuracy: 4/4
 ```
 
-**How grading works, and its real limits.** Grading is deliberately *not* LLM-as-judge — evaluating the system with another instance of the same kind of model felt like the wrong tradeoff for a 3-scenario check, and it would add a second source of non-determinism on top of the first. Instead, each scenario carries an `eval_keywords` fixture attached before ever seeing what the model says, and a top-1 hypothesis counts as correct if its description contains any of them. This is simple and fully auditable from the printed table — but it is a substring match on English text, and it has a real, demonstrated failure mode: a `resource_exhaustion_slow_leak` keyword list that included generic words like `"memory"`/`"oom"` once let a wrong hypothesis ("a workload spike caused higher memory usage," not a leak) pass grading purely because those words also appear in the *alert itself*. Any new scenario's `eval_keywords` should be specific enough to actually discriminate the correct causal story from a plausible-sounding wrong one — not just co-occur with the alert text. Periodically sampling a few raw hypothesis descriptions by hand (not just trusting the YES/NO column) is still worth doing.
+**How grading works, and its real limits.** Grading is deliberately *not* LLM-as-judge — evaluating the system with another instance of the same kind of model felt like the wrong tradeoff for a small, fixed-scenario check, and it would add a second source of non-determinism on top of the first. Instead, each scenario carries an `eval_keywords` fixture attached before ever seeing what the model says, and a top-1 hypothesis counts as correct if its description contains any of them. This is simple and fully auditable from the printed table — but it is a substring match on English text, and it has a real, demonstrated failure mode: a `resource_exhaustion_slow_leak` keyword list that included generic words like `"memory"`/`"oom"` once let a wrong hypothesis ("a workload spike caused higher memory usage," not a leak) pass grading purely because those words also appear in the *alert itself*. Any new scenario's `eval_keywords` should be specific enough to actually discriminate the correct causal story from a plausible-sounding wrong one — not just co-occur with the alert text. Periodically sampling a few raw hypothesis descriptions by hand (not just trusting the YES/NO column) is still worth doing.
 
 ### Testing the human approval gate interactively
 
@@ -254,17 +258,17 @@ Even at `temperature=0`, wording and confidence scores vary somewhat between run
 - **Eval grading is keyword-based, not semantic.** See "How grading works" above — it can be gamed by coincidental word overlap with the alert text if a scenario's `eval_keywords` aren't chosen carefully, and it says nothing about hypothesis *quality* beyond correctness (a correct-but-circular hypothesis and a correct-and-well-reasoned one grade identically).
 - **Real LLM calls cost money.** Every scenario run makes at least two calls (`generate_hypotheses` + `rank_hypotheses`, more if a reject or widen loop fires) against whichever model `reasoning_model`/`ranking_model` in `config.py` point at.
 - **LangSmith tracing is observability-only.** Nothing in the app currently reads anything back from a LangSmith project — no dataset-based eval, no online scoring.
-- **The postmortem corpus is tiny (4 documents) and shared across all three scenarios.** Retrieval quality (0.61 similarity for a real match, clearly separated from ~0.2–0.4 distractors, in current testing) hasn't been stress-tested against a larger, noisier corpus.
+- **The postmortem corpus is tiny (4 documents) and shared across all four scenarios** (only one has a declared match; the rest exercise the "no real match, don't fabricate one" path). Retrieval quality (0.61 similarity for a real match, clearly separated from ~0.2–0.4 distractors, in current testing) hasn't been stress-tested against a larger, noisier corpus.
 - **Upstream health is a status flag, not a time series.** There's no way yet to compare an upstream's anomaly *onset* against the alerting service's own onset — a genuinely stronger causal signal than hop distance alone. See "Upstream dependency health" above for what that would take.
-- **No golden scenario yet directly tests the case that motivated this feature**: a distant-hop upstream being degraded *without* real isolation at the intermediate hop, where the correct answer really is the farther one despite the closer-hop prior. The existing scenarios test related but different things (a healthy 1-hop upstream that's a red herring; a genuinely-degraded 1-hop upstream that *is* the answer). Worth adding as a dedicated fourth scenario before trusting the "prior, not filter" prompt guidance under real pressure.
+- **The broken-bulkhead case is now golden-tested** (`upstream_cascade_broken_bulkhead`, 12/12 correct across repeated runs) — closing what was previously listed here as a gap. Worth noting what it does *not* cover: the scenario's `upstream_health` entries directly state that auth-service has no timeout/circuit-breaker, in plain English, rather than the model having to infer a lack of isolation from indirect signals. That's a fair test of the prompt's reasoning given the chosen lightweight-status-flag fidelity (see above) — it is not a test of whether the model can *detect* a broken bulkhead from raw telemetry the way real tracing-based tooling would have to.
 - **The dependency graph itself (`data/service_topology.json`) is hand-authored and tiny** (8 services, linear 2-hop chains, no cycles or high fan-out exercised). A real service's dependency graph is wider and messier; `DummyServiceHealthClient`'s BFS is written to handle cycles and depth limits correctly, but that's untested against an actually gnarly graph.
-- **Prompt changes have had non-obvious side effects before.** Strengthening the root-cause-vs-symptom guidance in `generate_hypotheses`'s prompt fixed a real ranking bug, but also — unintentionally — made the model willing to hypothesize a deploy that didn't exist in evidence, until a follow-up fix made that prior explicitly conditional (see [Evidence design](#evidence-design-what-the-llm-sees-vs-what-a-human-sees)). Any future prompt edit should be re-verified against all three golden scenarios, across multiple runs, not just the scenario it was written to fix.
+- **Prompt changes have had non-obvious side effects before.** Strengthening the root-cause-vs-symptom guidance in `generate_hypotheses`'s prompt fixed a real ranking bug, but also — unintentionally — made the model willing to hypothesize a deploy that didn't exist in evidence, until a follow-up fix made that prior explicitly conditional (see [Evidence design](#evidence-design-what-the-llm-sees-vs-what-a-human-sees)). Any future prompt edit should be re-verified against all four golden scenarios, across multiple runs, not just the scenario it was written to fix.
 
 ---
 
 ## Extending this
 
-- **Add a new golden scenario**: drop a new JSON into `data/synthetic_incidents/` following the existing shape (`alert`, `metrics`, `logs`, `deploys`, `upstream_health`, `correct_root_cause`, `correct_root_cause_summary`, `eval_keywords`, optionally `postmortem_match`) — `scripts/eval_scenarios.py` picks it up automatically. A "broken bulkhead" scenario (see [Known limitations](#known-limitations--things-to-watch-for)) is the most valuable one missing right now.
+- **Add a new golden scenario**: drop a new JSON into `data/synthetic_incidents/` following the existing shape (`alert`, `metrics`, `logs`, `deploys`, `upstream_health`, `correct_root_cause`, `correct_root_cause_summary`, `eval_keywords`, optionally `postmortem_match`) — `scripts/eval_scenarios.py` picks it up automatically. `upstream_cascade_broken_bulkhead` is a good template for a multi-hop scenario specifically.
 - **Extend the dependency graph**: add a service and its `upstream` list to `data/service_topology.json`, then reference it in any scenario's `upstream_health` map.
 - **Switch LLM provider**: set `LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` in `.env` — no code change.
 - **Wire a real client**: implement `clients/base.py`'s `MetricsClient`/`LogsClient`/`DeployClient`/`ServiceHealthClient` against a real Prometheus/Splunk/GitHub/service-mesh API, then point `graph/nodes.py`'s corresponding `fetch_*` function at it (currently a direct import of the `Dummy*` class — this is exactly where a `dummy_mode`-driven factory would go).

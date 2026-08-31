@@ -1,0 +1,39 @@
+{
+  "scenario_name": "upstream_cascade_broken_bulkhead",
+  "description": "No deploy, no downstream-to-billing-service issue directly. identity-provider (2 hops upstream) is having an internal outage causing token-signing requests to take seconds instead of milliseconds. auth-service (1 hop upstream) has no timeout or circuit breaker on its call to identity-provider -- a broken bulkhead -- so its own latency directly mirrors identity-provider's, with no independent problem of its own. That undampened failure cascades through auth-service into billing-service, which alerts. Correct root cause: identity-provider, 2 hops away, not auth-service, despite auth-service being the closer and therefore naively more 'suspicious' hop.",
+  "correct_root_cause": "upstream_cascade",
+  "correct_root_cause_summary": "identity-provider (2 hops upstream) is degraded due to an internal token-signing outage. auth-service (1 hop upstream) has no timeout/circuit-breaker protecting it from identity-provider, so its own latency and errors are entirely a pass-through of identity-provider's failure, not an independent problem. billing-service's alert is the far end of that undampened chain.",
+  "service_name": "billing-service",
+  "requires_widened_window": false,
+  "eval_keywords": ["identity-provider", "identity provider"],
+  "upstream_health": {
+    "auth-service": {"status": "degraded", "detail": "latency and error rate elevated in lockstep with identity-provider -- no timeout or circuit breaker configured on its call to identity-provider, so it has no independent explanation of its own"},
+    "identity-provider": {"status": "degraded", "detail": "internal token-signing outage; token validation requests taking 4-8s instead of the usual ~50ms"}
+  },
+
+  "alert": {
+    "alert_name": "BillingServiceLatencyHigh",
+    "service": "billing-service",
+    "severity": "critical",
+    "message": "billing-service p99 latency exceeded 3000ms for 5 minutes"
+  },
+
+  "metrics": {
+    "latency_p99_ms": {"baseline": 150, "unit": "ms", "pattern": "linear_climb", "anomaly_start_offset_minutes": -22, "anomaly_end_offset_minutes": -2, "peak_value": 6200},
+    "error_rate_pct": {"baseline": 0.3, "unit": "pct", "pattern": "linear_climb", "anomaly_start_offset_minutes": -22, "anomaly_end_offset_minutes": -2, "peak_value": 6.5},
+    "cpu_usage_pct": {"baseline": 30, "unit": "pct", "pattern": "flat"},
+    "memory_usage_mb": {"baseline": 900, "unit": "mb", "pattern": "flat"}
+  },
+
+  "logs": [
+    {"offset_minutes": -21, "level": "ERROR", "message": "auth-service token validation request timed out after 6000ms"},
+    {"offset_minutes": -16, "level": "ERROR", "message": "auth-service token validation request timed out after 6200ms"},
+    {"offset_minutes": -11, "level": "ERROR", "message": "auth-service token validation request timed out after 5800ms"},
+    {"offset_minutes": -6, "level": "ERROR", "message": "auth-service token validation request timed out after 6500ms"},
+    {"offset_minutes": -1, "level": "ERROR", "message": "auth-service token validation request timed out after 6100ms"}
+  ],
+
+  "deploys": [],
+
+  "postmortem_match": null
+}
