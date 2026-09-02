@@ -31,5 +31,6 @@ class DummyGithubClient(DeployClient):
                 "merged_at": merged_at.isoformat(),
                 "author": entry["author"],
                 "diff_summary": entry["diff_summary"],
+                "files_changed": entry.get("files_changed", []),
             })
         return results

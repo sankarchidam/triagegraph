@@ -14,6 +14,17 @@ from typing import Literal, Optional, TypedDict
 from pydantic import BaseModel, Field
 
 
+class CodeChange(BaseModel):
+    """One changed hunk from a deploy's diff -- what fetch_deploys actually
+    points the LLM at, instead of just a PR title/summary. file_path/line_*
+    are what let a Hypothesis cite a real line instead of a PR number."""
+    file_path: str
+    line_start: int
+    line_end: int
+    snippet: str  # the changed lines themselves, verbatim
+    change_type: Literal["added", "removed", "modified"] = "modified"
+
+
 class Evidence(BaseModel):
     id: str  # stable short id (e.g. "metrics-0") so a Hypothesis can cite exactly which evidence it means
     source: Literal["metrics", "logs", "deploys", "postmortems", "upstream_health"]
@@ -23,6 +34,7 @@ class Evidence(BaseModel):
     # machine-checkable so assess_evidence doesn't have to parse English out of `summary`
     hop_distance: Optional[int] = None  # set only for source == "upstream_health" -- how many dependency
     # hops away that service is, so the LLM can weigh it as a structured fact rather than parsed-out prose
+    code_changes: list[CodeChange] = Field(default_factory=list)  # set only for source == "deploys"
 
 
 class Hypothesis(BaseModel):
@@ -32,6 +44,10 @@ class Hypothesis(BaseModel):
     supporting_evidence: list[str] = Field(default_factory=list)  # Evidence ids/summaries
     contradicting_evidence: list[str] = Field(default_factory=list)
     recommended_next_step: str
+    implicated_code: Optional[str] = None  # "file_path:line_start-line_end" when a cited deploy's
+    # code_changes is what makes this hypothesis plausible; null otherwise. Carried through
+    # rank_hypotheses from the draft, same as `description` -- it's a citation, not something
+    # the ranking pass re-derives.
 
 
 class IncidentState(TypedDict):

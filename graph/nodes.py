@@ -59,7 +59,7 @@ from clients.service_topology_dummy import DummyServiceHealthClient
 from clients.splunk_dynatrace_dummy import DummyLogsClient
 from config import settings
 from graph.llm import get_chat_model
-from graph.state import Evidence, Hypothesis, IncidentState
+from graph.state import CodeChange, Evidence, Hypothesis, IncidentState
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -211,6 +211,7 @@ def fetch_deploys(state: IncidentState) -> dict:
             summary=f"PR #{d['pr_number']} \"{d['title']}\" merged by {d['author']} at {d['merged_at']}: {d['diff_summary']}",
             raw_ref=f"pr:{d['pr_number']}",
             is_notable=True,  # a deploy in the window is inherently worth surfacing
+            code_changes=[CodeChange(**fc) for fc in d.get("files_changed", [])],
         )
         for i, d in enumerate(deploys)
     ]
@@ -331,7 +332,15 @@ def _all_evidence(state: IncidentState) -> list[Evidence]:
 def _evidence_listing(evidence: list[Evidence]) -> str:
     if not evidence:
         return "(no evidence gathered)"
-    return "\n".join(f"- [{e.id}] ({e.source}): {e.summary}" for e in evidence)
+    lines = []
+    for e in evidence:
+        lines.append(f"- [{e.id}] ({e.source}): {e.summary}")
+        for cc in e.code_changes:
+            lines.append(f"    {cc.file_path}:{cc.line_start}-{cc.line_end} ({cc.change_type})")
+            lines.append("    ```")
+            lines.extend(f"    {ln}" for ln in cc.snippet.splitlines())
+            lines.append("    ```")
+    return "\n".join(lines)
 
 
 class HypothesisDraft(BaseModel):
@@ -343,6 +352,13 @@ class HypothesisDraft(BaseModel):
     supporting_evidence: list[str] = Field(default_factory=list, description="Evidence ids, e.g. 'deploys-0'")
     contradicting_evidence: list[str] = Field(default_factory=list, description="Evidence ids")
     recommended_next_step: str
+    implicated_code: Optional[str] = Field(
+        default=None,
+        description="If a deploy evidence item's code snippet is what makes this hypothesis plausible, the exact "
+        "'file_path:line_start-line_end' it cites, e.g. 'consumers/order_events.py:41-47'. Must match a file_path/"
+        "line range actually shown under that evidence item -- never invent one. Null if no code snippet supports "
+        "this hypothesis.",
+    )
 
 
 class GeneratedHypotheses(BaseModel):
@@ -376,6 +392,12 @@ own standalone hypothesis if no deploy or change plausibly explains it.
 If there is NO deploy evidence listed below at all, do not hypothesize one anyway -- "deploys are usually the cause" \
 is a prior about incidents that have a deploy in evidence, not permission to assume an unlogged one happened. An \
 empty deploy list is itself informative: it rules deploys out, it doesn't leave them open as a guess.
+
+Some deploy evidence items show one or more changed code snippets underneath them, each labeled with its exact \
+file path and line range (e.g. "consumers/order_events.py:41-47"). When a snippet like this is what makes a deploy \
+hypothesis plausible -- the actual lines show the mechanism, not just a title -- cite that exact "file_path:line_start-\
+line_end" in implicated_code, copied verbatim from the label shown, not paraphrased or guessed. Leave implicated_code \
+null for any hypothesis no shown snippet supports, including deploys whose evidence item has no snippet under it at all.
 
 Upstream health evidence is tagged with a hop distance (e.g. "1 hop upstream", "2 hops upstream" of the alerting \
 service). Treat distance as a prior, not a rule: a DEGRADED service 1 hop away is, all else equal, a more likely \
@@ -425,6 +447,7 @@ def generate_hypotheses(state: IncidentState) -> dict:
             supporting_evidence=d.supporting_evidence,
             contradicting_evidence=d.contradicting_evidence,
             recommended_next_step=d.recommended_next_step,
+            implicated_code=d.implicated_code,
         )
         for i, d in enumerate(result.hypotheses)
     ]
@@ -511,6 +534,7 @@ def rank_hypotheses(state: IncidentState) -> dict:
             supporting_evidence=r.supporting_evidence,
             contradicting_evidence=r.contradicting_evidence,
             recommended_next_step=r.recommended_next_step,
+            implicated_code=original.implicated_code,
         ))
 
     ranked.sort(key=lambda h: h.confidence, reverse=True)
@@ -572,6 +596,14 @@ def finalize_report(state: IncidentState) -> dict:
         lines.append(f"> ⚠️ **Insufficient evidence noted by the model:** {state['insufficient_evidence_note']}")
         lines.append("")
 
+    # file_path:line_start-line_end -> CodeChange, so a hypothesis's implicated_code citation
+    # can be rendered with its actual snippet instead of just the bare "file:lines" string.
+    code_by_ref = {
+        f"{cc.file_path}:{cc.line_start}-{cc.line_end}": cc
+        for e in state.get("deploy_evidence", [])
+        for cc in e.code_changes
+    }
+
     ranked = state.get("ranked_hypotheses", [])
     if ranked:
         lines.append("## Ranked hypotheses")
@@ -579,6 +611,13 @@ def finalize_report(state: IncidentState) -> dict:
             lines.append(f"### {h.id}. {h.description}  (confidence {h.confidence:.2f})")
             lines.append(f"- Supporting: {', '.join(h.supporting_evidence) or '(none cited)'}")
             lines.append(f"- Contradicting: {', '.join(h.contradicting_evidence) or '(none cited)'}")
+            if h.implicated_code:
+                lines.append(f"- Implicated code: `{h.implicated_code}`")
+                cc = code_by_ref.get(h.implicated_code)
+                if cc is not None:
+                    lines.append("  ```")
+                    lines.extend(f"  {ln}" for ln in cc.snippet.splitlines())
+                    lines.append("  ```")
             lines.append(f"- Next step: {h.recommended_next_step}")
             lines.append("")
 

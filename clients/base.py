@@ -29,7 +29,12 @@ class DeployClient(ABC):
     @abstractmethod
     def list_deploys(self, service_name: str, start: str, end: str) -> list[dict]:
         """Must return a list of merged-PR/deploy events shaped like
-        {"pr_number": ..., "title": ..., "merged_at": ..., "author": ..., "diff_summary": ...}"""
+        {"pr_number": ..., "title": ..., "merged_at": ..., "author": ..., "diff_summary": ...,
+        "files_changed": [{"file_path": ..., "line_start": ..., "line_end": ..., "snippet": ...,
+        "change_type": "added"|"removed"|"modified"}]}. files_changed may be empty if no
+        line-level diff is available -- a real client would populate it from the PR's diff
+        (e.g. GitHub's GET /repos/{owner}/{repo}/pulls/{pr}/files `patch` field, sliced into
+        hunks); the dummy client reads it straight from the scenario fixture."""
         ...
 
 

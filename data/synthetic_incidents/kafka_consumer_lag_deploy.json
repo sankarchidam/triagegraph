@@ -34,7 +34,13 @@
   ],
 
   "deploys": [
-    {"offset_minutes": -20, "pr_number": 482, "title": "Switch order-events deserialization to Avro schema v3", "author": "j.rivera", "diff_summary": "Replaces JSON deserializer with Avro deserializer for order-events topic; adds schema-registry client with a 3s request timeout per message."}
+    {"offset_minutes": -20, "pr_number": 482, "title": "Switch order-events deserialization to Avro schema v3", "author": "j.rivera", "diff_summary": "Replaces JSON deserializer with Avro deserializer for order-events topic; adds schema-registry client with a 3s request timeout per message.",
+      "files_changed": [
+        {"file_path": "consumers/order_events.py", "line_start": 41, "line_end": 47, "change_type": "modified",
+          "snippet": "-        self.deserializer = JSONDeserializer()\n+        self.schema_client = SchemaRegistryClient(url=SCHEMA_REGISTRY_URL, timeout_s=3.0)\n+        self.deserializer = AvroDeserializer(self.schema_client, schema=ORDER_EVENT_SCHEMA_V3)"},
+        {"file_path": "consumers/order_events.py", "line_start": 88, "line_end": 91, "change_type": "modified",
+          "snippet": "-        payload = self.deserializer.decode(msg.value())\n+        # Avro path requires a schema-registry round trip per message; no local cache yet.\n+        payload = self.deserializer.decode(msg.value(), ctx=self.serialization_context)"}
+      ]}
   ],
 
   "postmortem_match": null
